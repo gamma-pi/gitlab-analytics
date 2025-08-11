@@ -1,0 +1,17 @@
+# Absolute core requirements
+requests==2.31.0
+pandas==2.1.4
+matplotlib==3.8.2
+numpy==2.3.1
+seaborn==0.13.0
+python-dateutil==2.8.2
+
+# Security (required for GitLab API SSL)
+pyopenssl==23.3.0
+
+# Note: Parallelization uses built-in Python modules:
+# - concurrent.futures (built-in since Python 3.2+)
+# - threading (built-in)
+# - queue (built-in)
+# - gc (garbage collection, built-in)
+# - typing (built-in since Python 3.5+)
