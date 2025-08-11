@@ -91,19 +91,10 @@ The below HTML file reports are generated for each env = [prod, nprod]
 - Start with defaults, then increase workers/batches
 - Monitor system resources during first runs
 
-#### Analytics + Upload to Confluence
-```bash
-python analytics.py --env prod --upload_confluence
-```
-
-#### Upload Only (skip analysis, upload existing reports)
-```bash
-python analytics.py --upload_only --upload_confluence
-```
-
 #### Analytics + Automatic Publish via confluence.py
 ```bash
 python analytics.py --env prod --publish
+```
 
 ## 📁 Project Structure
 
