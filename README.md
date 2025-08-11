@@ -1,6 +1,23 @@
 # GitLab CI/CD Analytics Tool
 
-# Updated GitLab CI/CD Analytics Tool v06.06.25
+## Current version: v11.08.25
+
+## Overview
+
+`analytics.py` is a **comprehensive GitLab CI/CD analytics and reporting utility**.  
+It collects repository-level CI/CD pipeline data, analyzes metrics such as:
+
+- Pipeline success/failure rates
+- Branch protection coverage
+- Merge request approval rules
+- Repository health scores
+- Job duration statistics
+
+It then generates **visual reports** (HTML dashboards and plots) and can optionally **upload results to Confluence**.
+
+With the **`--publish`** parameter, the tool can **automatically run `confluence.py` after completing analytics**, enabling a seamless end-to-end workflow:  
+1. Run analytics and generate reports.  
+2. Immediately publish to Confluence.  
 
 ## 🔧 Key Features
 - Parallel repository analysis with configurable workers
@@ -73,11 +90,20 @@ The below HTML file reports are generated for each env = [prod, nprod]
 ## Best Practices
 - Start with defaults, then increase workers/batches
 - Monitor system resources during first runs
-- For large groups (>500 repos), use:
 
+#### Analytics + Upload to Confluence
 ```bash
-python3 analytics.py --max_workers 14 --batch_size 200
+python analytics.py --env prod --upload_confluence
 ```
+
+#### Upload Only (skip analysis, upload existing reports)
+```bash
+python analytics.py --upload_only --upload_confluence
+```
+
+#### Analytics + Automatic Publish via confluence.py
+```bash
+python analytics.py --env prod --publish
 
 ## 📁 Project Structure
 
