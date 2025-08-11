@@ -1,0 +1,28 @@
+{
+  "gitlab": {
+    "private_token": "your-gitlab-token",
+    "base_url": "https://gitlab.com"
+  },
+  "confluence": {
+    "base_url": "https://confluence.com",
+    "space_key": "CI",
+    "page_id": "xxxxxxxxx",       
+    "username": "youremail@somewhere.com",
+    "auth": {
+      "type": "pat",
+      "token": "yourtoken"
+    },
+    "reports": {
+      "publish_page_ids": {
+        "prod": {
+          "domain_comparison": "pageid",
+          "repository_health": "pageid"
+        },
+        "nprod": {
+          "domain_comparison": "pageid",
+          "repository_health": "pageid"
+        }
+      }
+    }
+  }
+}
