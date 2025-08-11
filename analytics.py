@@ -1749,6 +1749,9 @@ if __name__ == "__main__":
                           help="Upload reports to Confluence (disabled by default)")
     # parser.add_argument("--no_confluence", action="store_true",
     #                   help="Skip Confluence upload")
+    parser.add_argument("--publish", action="store_true",
+                      help="Run confluence.py after analytics completes")
+    
     args = parser.parse_args()
 
     # Default behavior - production with upload unless explicitly disabled
@@ -1767,3 +1770,9 @@ if __name__ == "__main__":
         upload_to_confluence=upload_to_confluence,
         upload_only=args.upload_only
     )
+
+    # Trigger confluence.py if --publish is set
+    if args.publish:
+        script_path = os.path.join(os.path.dirname(__file__), "confluence.py")
+        logger.info(f"Publishing to Confluence by running: {script_path}")
+        subprocess.run([sys.executable, script_path, "--env", args.env], check=True)
