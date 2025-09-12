@@ -2,24 +2,26 @@ import os
 import sys
 import requests
 import json
-import matplotlib.pyplot as plt
-import seaborn as sns
+import time
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Union, Any
-import numpy as np
 from collections import defaultdict
-import textwrap
-import time
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from queue import Queue
-from io import BytesIO
-
-import base64, mimetypes
-from urllib.parse import urljoin
 from pathlib import Path
+from dateutil import parser as date_parser
+import random
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
 
 sys.path.append(os.getcwd())
 
@@ -35,334 +37,148 @@ from common.gitlab_utils import (
     process_subdomains
 )
 
+EXCLUDED_JOBS = [
+    "ctmem_cicd_pipeline", "publish-package", "retrieve-artifact-vault", 
+    "create-rfc_std", "deploy-prd-infra-config", "deploy-sit-infra-config", 
+    "deploy-infra-config", "SIT-deploy", "SIT_rollback", "dev_deploy", 
+    "dev_rollback", "SIT_deploy", "prod_deploy", " prod_deploy", 
+    "prod_deploy ", " prod_deploy ", "test-np", "prepare-requirements", 
+    "determine-package-source"
+]
+
 logger = set_logg_handlers_to_console_and_file("logs/cicd_analytics.log")
 
-# GitLab API details
-gitlab_url = 'https://gitlab.com/'
+gitlab_url = 'https://gitlab.dell.com/'
 pem_file = "utils/cert.pem"
 
-# Visualization settings
-plt.style.use('seaborn-v0_8')
-sns.set_palette("husl")
-plt.rcParams['figure.facecolor'] = 'white'
-plt.rcParams['axes.grid'] = True
-plt.rcParams['grid.alpha'] = 0.3
+# -----------------------------
+# Helper functions
+# -----------------------------
+def normalize_name(name: str) -> str:
+    """Normalize GitLab domain/subdomain names to match JSON keys."""
+    if not name:
+        return ""
+    return name.replace("_", " ").strip().title()
 
-def load_config(config_file: str = "config.json") -> Dict[str, Any]:
-    """
-    Load configuration from JSON file.
-    
-    Args:
-        config_file: Path to the configuration file
-        
-    Returns:
-        Dictionary with configuration values
-        
-    Raises:
-        FileNotFoundError: If config file doesn't exist
-        json.JSONDecodeError: If config file is invalid JSON
-    """
-    config_path = Path(__file__).parent / config_file
-    if not config_path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-    
-    with open(config_path, 'r') as f:
-        return json.load(f)
+# -----------------------------
+# DAD Score Fetching Functions
+# -----------------------------
 
-class ConfluenceClient:
-    """
-    Complete Confluence API client with all original methods plus enhanced file attachment handling.
-    """
-    
-    def __init__(self, base_url: str, username: str, api_token: str):
-        """
-        Initialize the Confluence client with proper authentication.
-        """
-        # Standardize base URL
-        base_url = base_url.rstrip('/')
-        if not base_url.endswith('wiki'):
-            base_url = f"{base_url}/wiki"
-        base_url += '/'
-        
-        self.base_url = base_url
-        self.api_token = api_token
-        
-        # Configure session
-        self.session = requests.Session()
-        
-        # Use certificate if provided, otherwise disable verification
-        if os.path.exists(pem_file):
-            self.session.verify = pem_file
+def init_browser(headless: bool = True):
+    """Initialize Chrome browser for Selenium."""
+    chrome_options = Options()
+    if headless:
+        chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
+    return driver
+
+def fetch_dad_score_for_project(project_id: str, config_path="config.json") -> float:
+    """Fetch DAD score using API call instead of Selenium."""
+    if not project_id:
+        return np.nan
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    dad_api_config = config.get("confluence", {}).get("reports", {}).get("dad_api", {})
+    base_url = dad_api_config.get("base_url")
+    token = dad_api_config.get("access_token")
+
+    if not base_url or not token:
+        logger.error("DAD API configuration missing")
+        return np.nan
+
+    url = f"{base_url}/{project_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            # Adjust the key here based on API response JSON structure
+            score = data.get("maturityScore") or data.get("score")
+            return float(score) if score is not None else np.nan
         else:
-            logger.warning(f"Certificate file not found at {pem_file}, disabling SSL verification")
-            self.session.verify = False
-        
-        # Updated headers with X-Atlassian-Token
-        self.session.headers.update({
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {api_token}',
-            'X-Atlassian-Token': 'no-check'
-        })
-        
-        # Rate limiting defaults
-        self.rate_limit_remaining = 20
-        self.rate_limit_reset = 60
-        
-        logger.debug(f"Confluence client initialized with base URL: {self.base_url}")
+            logger.error(f"DAD API request failed for {project_id}: {response.status_code}")
+            return np.nan
+    except Exception as e:
+        logger.error(f"Error fetching DAD score for {project_id}: {e}")
+        return np.nan
 
-    def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None, 
-                     params: Optional[Dict] = None, files: Optional[Dict] = None) -> Optional[Dict]:
-        """
-        Enhanced request handler with proper authentication and error handling.
-        """
-        # Clean endpoint path
-        endpoint = endpoint.lstrip('/')
-        url = urljoin(self.base_url, endpoint)
-        
-        try:
-            logger.debug(f"Making {method} request to {url}")
-            
-            request_kwargs = {
-                'method': method,
-                'url': url,
-                'json': data,
-                'params': params,
-                'files': files,
-                'timeout': 30,
-                'verify': self.session.verify
-            }
-            
-            # Remove None values
-            request_kwargs = {k: v for k, v in request_kwargs.items() if v is not None}
-            
-            response = self.session.request(**request_kwargs)
-            
-            # Handle rate limiting
-            self._update_rate_limits(response.headers)
-            
-            if response.status_code == 429:
-                wait_time = self.rate_limit_reset + 1
-                logger.warning(f"Rate limit exceeded. Waiting {wait_time} seconds...")
-                time.sleep(wait_time)
-                return self._make_request(method, endpoint, data, params, files)
-                
-            response.raise_for_status()
-            return response.json() if response.content else None
-            
-        except requests.exceptions.RequestException as e:
-            self._handle_request_error(e)
-            return None
+def add_dad_scores(df, config_path="config.json"):
+    """Fetch DAD scores for all subdomains using API."""
+    with open(config_path, "r") as f:
+        config = json.load(f)
 
-    def _update_rate_limits(self, headers: Dict):
-        """Update rate limit tracking from headers"""
-        if 'X-RateLimit-Remaining' in headers:
-            self.rate_limit_remaining = int(headers['X-RateLimit-Remaining'])
-        if 'X-RateLimit-Reset' in headers:
-            self.rate_limit_reset = int(headers['X-RateLimit-Reset'])
+    # Flatten projectID column: use 'appID' if it's a dict
+    df["projectID"] = df["projectID"].apply(lambda x: x['appID'] if isinstance(x, dict) and 'appID' in x else x)
 
-    def _handle_request_error(self, error: Exception):
-        """Log detailed error information"""
-        logger.error(f"Request failed: {error}")
-        
-        if hasattr(error, 'response') and error.response is not None:
-            response = error.response
-            try:
-                error_details = response.json()
-                logger.error(f"Error details: {error_details}")
-            except ValueError:
-                logger.error(f"Response content: {response.text}")
-            
-            logger.error(f"Status code: {response.status_code}")
-            logger.error(f"Headers: {response.headers}")
-            
-            if response.status_code == 403:
-                logger.error("""
-                    Common 403 Fixes:
-                    1. Verify your API token has correct permissions
-                    2. Check if your Confluence instance requires special headers
-                    3. Ensure your user account has access to the target page
-                    4. Confirm your authentication method (Basic Auth is often disabled)
-                """)
-                
-    def get_page(self, page_id: str) -> Optional[Dict]:
-        """Get a page by ID."""
-        return self._make_request('GET', f'rest/api/content/{page_id}?expand=body.storage,version')
-        
-    def update_page(self, page_id: str, title: str, content: str) -> Optional[Dict]:
-        """Update an existing page."""
-        page = self.get_page(page_id)
-        if not page:
-            return None
-            
-        new_version = page['version']['number'] + 1
-        
-        data = {
-            'id': page_id,
-            'type': 'page',
-            'title': title,
-            'body': {
-                'storage': {
-                    'value': content,
-                    'representation': 'storage'
-                }
-            },
-            'version': {
-                'number': new_version,
-                'message': f'Updated by CI/CD Analytics at {datetime.now().isoformat()}'
-            }
+    project_ids = [pid for pid in df["projectID"].to_list() if pid]
+
+    if not project_ids:
+        logger.warning("No valid project IDs found")
+        df["DADscore"] = np.nan
+        return df
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_pid = {
+            executor.submit(fetch_dad_score_for_project, pid, config_path): pid
+            for pid in project_ids
         }
-        
-        return self._make_request('PUT', f'rest/api/content/{page_id}', data=data)
-        
-    def attach_file(self, page_id: str, file_path: str, comment: str = '', 
-                   minor_edit: bool = True, allow_duplicates: bool = True) -> Optional[Dict]:
-        """
-        Enhanced file attachment with:
-        - Better version control
-        - Duplicate handling
-        - Improved error handling
-        
-        Args:
-            page_id: ID of the page to attach to
-            file_path: Local path to file
-            comment: Attachment comment
-            minor_edit: Whether to mark as minor edit
-            allow_duplicates: Whether to allow duplicate attachments
-            
-        Returns:
-            Dictionary with attachment details or None if failed
-        """
-        try:
-            # Validate file exists
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Attachment file not found: {file_path}")
-                
-            # Get file metadata
-            file_name = os.path.basename(file_path)
-            file_size = os.path.getsize(file_path)
-            content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
-            
-            logger.info(f"Attaching {file_name} ({file_size} bytes) to page {page_id}")
-            
-            # Open file and prepare request
-            with open(file_path, 'rb') as file_data:
-                response = self._make_request(
-                    'POST',
-                    f'rest/api/content/{page_id}/child/attachment',
-                    files={'file': (file_name, file_data, content_type)},
-                    params={
-                        'allowDuplicated': str(allow_duplicates).lower(),
-                        'comment': comment,
-                        'minorEdit': str(minor_edit).lower()
-                    }
-                )
-                
-            if not response:
-                logger.error("No response received for attachment upload")
-                return None
-                
-            # Handle different response formats
-            if isinstance(response, list):
-                return response[0] if response else None
-            elif 'results' in response:
-                return response['results'][0] if response['results'] else None
-            return response
-            
-        except FileNotFoundError as e:
-            logger.error(str(e))
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error attaching file: {str(e)}")
-            return None
 
-    def upload_report_to_confluence(
-        self,
-        target_page_id: str,
-        report_path: str,
-        env: str,
-        days_back: int
-    ) -> bool:
-        """
-        Enhanced report upload with:
-        - Better page version control
-        - Improved error handling
-        - More informative logging
-        """
-        try:
-            if not os.path.exists(report_path):
-                logger.error(f"Report file not found: {report_path}")
-                return False
-                
-            logger.info(f"Starting Confluence upload for {report_path}")
-            
-            # Get existing page
-            page = self.get_page(target_page_id)
-            if not page:
-                logger.error(f"Could not retrieve target page {target_page_id}")
-                return False
-                
-            # Prepare new content
-            env_title = "Production" if env == "prod" else "Non-Production"
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Create a new section with file preview
-            new_section = f"""
-            <h2>{env_title} CI/CD Analytics Report - {current_time}</h2>
-            <p>Analysis period: Last {days_back} days</p>
-            <p>Generated report attached below:</p>
-            <p><ac:structured-macro ac:name="view-file" ac:schema-version="1">
-                <ac:parameter ac:name="name">{os.path.basename(report_path)}</ac:parameter>
-            </ac:structured-macro></p>
-            <hr/>
-            """
-            
-            # Update page content
-            existing_content = page['body']['storage']['value']
-            updated_content = new_section + existing_content
-            
-            # Update the page first
-            update_result = self.update_page(
-                target_page_id,
-                page['title'],
-                updated_content
-            )
-            
-            if not update_result:
-                logger.error("Failed to update page content")
-                return False
-                
-            # Attach the file with retry logic
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    attachment_result = self.attach_file(
-                        target_page_id,
-                        report_path,
-                        comment=f"{env_title} CI/CD Analytics Report generated on {current_time}",
-                        minor_edit=True
-                    )
-                    
-                    if attachment_result:
-                        logger.info(f"Successfully uploaded report to Confluence page {target_page_id}")
-                        return True
-                        
-                    logger.warning(f"Attachment attempt {attempt} failed")
-                    if attempt < max_retries:
-                        time.sleep(2 ** attempt)  # Exponential backoff
-                        
-                except Exception as e:
-                    logger.error(f"Attachment attempt {attempt} failed with error: {str(e)}")
-                    if attempt == max_retries:
-                        raise
-                    time.sleep(2 ** attempt)
-            
-            logger.error(f"Failed to attach file after {max_retries} attempts")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error during Confluence upload: {str(e)}", exc_info=True)
-            return False
+        for future in as_completed(future_to_pid):
+            pid = future_to_pid[future]
+            try:
+                score = future.result()
+            except Exception as e:
+                logger.error(f"Error fetching DADscore for project {pid}: {e}")
+                score = np.nan
+            results[pid] = score
+            logger.info(f"DADscore fetched for project {pid}: {score}")
+
+    # Map scores back to DataFrame
+    df["DADscore"] = df["projectID"].map(lambda pid: results.get(pid, np.nan))
+    return df
+
+def get_group_description(group_id: int) -> Optional[str]:
+    """Fetch GitLab group/subgroup description."""
+    url = f"{gitlab_url}api/v4/groups/{group_id}"
+    response = requests.get(url, headers=get_headers(), verify=pem_file, timeout=30)
+    if response.status_code == 200:
+        return response.json().get('description', None)
+    else:
+        logger.warning(f"Failed to fetch description for group {group_id}: {response.status_code}")
+        return None
+    
+def apply_projectID_mapping(df: pd.DataFrame, mapping_path: str = "subdomain_projectID_map.json") -> pd.DataFrame:
+    with open(mapping_path, "r") as f:
+        project_map = json.load(f)
+
+    unmatched = []
+
+    def resolve_projectID(row):
+        domain = normalize_name(row["domain"])
+        subdomain = normalize_name(row["subdomain"]) if pd.notna(row["subdomain"]) else None
+        domain_entry = next((d for d in project_map if normalize_name(d) == domain), None)
+        if not domain_entry:
+            unmatched.append((row["domain"], row["subdomain"]))
+            return None
+        domain_data = project_map[domain_entry]
+        if subdomain and "subdomains" in domain_data:
+            sub_entry = next((s for s in domain_data["subdomains"] if normalize_name(s) == subdomain), None)
+            if sub_entry:
+                return domain_data["subdomains"][sub_entry].get("appID") or domain_data.get("appID")
+        return domain_data.get("appID")
+
+    df["projectID"] = df.apply(resolve_projectID, axis=1)
+    if unmatched:
+        logger.warning(f"Unmatched domain/subdomains: {unmatched}")
+    return df
+
 
 class ThreadSafeCounter:
     """Thread-safe counter for tracking progress."""
@@ -375,79 +191,113 @@ class ThreadSafeCounter:
             self._value += 1
             return self._value
 
-class GitLabCICDAnalytics:
+class GitLabDataFrameCollector:
     """
-    Comprehensive CI/CD analytics class with enhanced capabilities:
-    - Pipeline success/failure analysis
-    - Job duration and performance metrics
-    - Branch protection analysis
-    - Merge request approval metrics
-    - Repository health scoring
-    - Comparative analysis across domains/subdomains
-    - Parallel processing for performance
-    - Confluence integration for report publishing
+    GitLab CI/CD data collector that builds a comprehensive DataFrame.
     """
     
-    def __enter__(self):
-        return self
-        
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
-        
-    def cleanup(self):
-        """Clean up resources"""
-        self.analytics_data.clear()
-        self.pipeline_data.clear()
-
-    def __init__(self, max_workers: int = 6, batch_size: int = 20):
-        self.analytics_data = []
-        self.pipeline_data = []
-        self.job_data = []
-        self.branch_data = []
-        self.approval_data = []
-        self.repository_health_scores = []
-        
-        # Parallelization settings
+    def __init__(self, max_workers: int = 16, batch_size: int = 80):
         self.max_workers = max_workers
         self.batch_size = batch_size
-        self._data_lock = threading.Lock()  # Protect shared data structures
+        self._data_lock = threading.Lock()
         self._progress_counter = ThreadSafeCounter()
+        self.pipeline_data = []
+        self.max_retries = 5
+        self.base_delay = 1
+        self.max_delay = 300
         
-    def _make_gitlab_request(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Enhanced request handler with retry logic."""
-        try:
-            response = requests.get(
-                url,
-                headers=get_headers(),
-                params=params,
-                verify=pem_file,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 60))
-                logger.warning(f"Rate limited. Retrying after {retry_after} seconds...")
-                time.sleep(retry_after)
-                return self._make_gitlab_request(url, params)
-            else:
-                logger.warning(f"API request failed: {url} - Status: {response.status_code}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error making request to {url}: {e}")
-            return None
+    def _calculate_backoff_delay(self, attempt: int, base_delay: float = None, max_delay: float = None) -> float:
+        if base_delay is None:
+            base_delay = self.base_delay
+        if max_delay is None:
+            max_delay = self.max_delay
+        exponential_delay = base_delay * (2 ** (attempt - 1))
+        capped_delay = min(exponential_delay, max_delay)
+        jitter = random.uniform(0.75, 1.25)
+        return capped_delay * jitter
 
-    def get_project_pipelines(self, project_id: int, days_back: int = 30, max_pipelines: int = 10) -> List[Dict]:
-        """Fetch pipelines with enhanced date filtering, pagination, and limits."""
+    def _make_gitlab_request(self, url: str, params: Optional[Dict] = None, max_retries: int = None) -> Optional[Dict]:
+        if max_retries is None:
+            max_retries = self.max_retries
+        last_exception = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.get(url, headers=get_headers(), params=params, verify=pem_file, timeout=30)
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    server_retry_after = response.headers.get('Retry-After')
+                    if server_retry_after:
+                        try:
+                            delay = min(int(server_retry_after), self.max_delay)
+                        except ValueError:
+                            delay = self._calculate_backoff_delay(attempt)
+                    else:
+                        delay = self._calculate_backoff_delay(attempt)
+                    if attempt < max_retries:
+                        logger.warning(f"Rate limited, retry {attempt}/{max_retries} in {delay:.1f}s: {url}")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Rate limited on final attempt {attempt}: {url}")
+                        return None
+                elif response.status_code in [502, 503, 504]:
+                    if attempt < max_retries:
+                        delay = self._calculate_backoff_delay(attempt)
+                        logger.warning(f"Server error {response.status_code}, retry {attempt}/{max_retries} in {delay:.1f}s: {url}")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Server error {response.status_code} on final attempt: {url}")
+                        return None
+                elif response.status_code == 404:
+                    logger.debug(f"Resource not found (404): {url}")
+                    return None
+                elif response.status_code in [401, 403]:
+                    logger.error(f"Authentication error {response.status_code}: {url}")
+                    return None
+                else:
+                    logger.warning(f"API request failed {response.status_code}: {url}")
+                    return None
+            except requests.exceptions.Timeout:
+                if attempt < max_retries:
+                    delay = self._calculate_backoff_delay(attempt)
+                    logger.warning(f"Timeout retry {attempt}/{max_retries} in {delay:.1f}s: {url}")
+                    time.sleep(delay)
+                    last_exception = "Timeout"
+                    continue
+                else:
+                    logger.error(f"Timeout on final attempt: {url}")
+                    return None
+            except requests.exceptions.ConnectionError:
+                if attempt < max_retries:
+                    delay = self._calculate_backoff_delay(attempt)
+                    logger.warning(f"Connection error retry {attempt}/{max_retries} in {delay:.1f}s: {url}")
+                    time.sleep(delay)
+                    last_exception = "Connection error"
+                    continue
+                else:
+                    logger.error(f"Connection error on final attempt: {url}")
+                    return None
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries:
+                    delay = self._calculate_backoff_delay(attempt)
+                    logger.warning(f"Request exception retry {attempt}/{max_retries} in {delay:.1f}s: {e}")
+                    time.sleep(delay)
+                    last_exception = str(e)
+                    continue
+                else:
+                    logger.error(f"Request exception on final attempt: {e}")
+                    return None
+        logger.error(f"All attempts failed for {url}. Last: {last_exception}")
+        return None
+
+    def get_project_pipelines(self, project_id: int, days_back: int = 30, max_pipelines: int = 100) -> List[Dict]:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
-        
         all_pipelines = []
         page = 1
-        per_page = min(max_pipelines, 100)  # Don't fetch more than needed per request
-        
+        per_page = min(max_pipelines, 100)
         while len(all_pipelines) < max_pipelines:
             url = f"{gitlab_url}api/v4/projects/{project_id}/pipelines"
             params = {
@@ -458,191 +308,152 @@ class GitLabCICDAnalytics:
                 'order_by': 'updated_at',
                 'sort': 'desc'
             }
-            
             pipelines = self._make_gitlab_request(url, params)
             if not pipelines:
                 break
-                
-            # Add pipelines but don't exceed the limit
             remaining_slots = max_pipelines - len(all_pipelines)
             all_pipelines.extend(pipelines[:remaining_slots])
-            
-            # Break if we've reached our limit or if this was the last page
             if len(all_pipelines) >= max_pipelines or len(pipelines) < per_page:
                 break
-                
             page += 1
-        
         return all_pipelines
-    
+
     def get_pipeline_jobs(self, project_id: int, pipeline_id: int) -> List[Dict]:
-        """Fetch jobs with additional performance metrics."""
         url = f"{gitlab_url}api/v4/projects/{project_id}/pipelines/{pipeline_id}/jobs?per_page=100"
         jobs = self._make_gitlab_request(url) or []
-        
-        # Add performance metrics
         for job in jobs:
             if job.get('started_at') and job.get('finished_at'):
-                started = datetime.fromisoformat(job['started_at'].replace('Z', '+00:00'))
-                finished = datetime.fromisoformat(job['finished_at'].replace('Z', '+00:00'))
+                started = date_parser.isoparse(job['started_at'])
+                finished = date_parser.isoparse(job['finished_at'])
                 job['actual_duration'] = (finished - started).total_seconds()
             else:
                 job['actual_duration'] = job.get('duration', 0)
-                
         return jobs
-    
-    def get_pipeline_jobs(self, project_id: int, pipeline_id: int) -> List[Dict]:
-        """Fetch jobs with additional performance metrics."""
-        url = f"{gitlab_url}api/v4/projects/{project_id}/pipelines/{pipeline_id}/jobs?per_page=100"
-        jobs = self._make_gitlab_request(url) or []
-        
-        # Add performance metrics
-        for job in jobs:
-            if job.get('started_at') and job.get('finished_at'):
-                started = datetime.fromisoformat(job['started_at'].replace('Z', '+00:00'))
-                finished = datetime.fromisoformat(job['finished_at'].replace('Z', '+00:00'))
-                job['actual_duration'] = (finished - started).total_seconds()
+
+    def get_merge_request_for_pipeline(self, project_id: int, pipeline_sha: str) -> Optional[Dict]:
+        url = f"{gitlab_url}api/v4/projects/{project_id}/merge_requests"
+        params = {'state': 'all', 'order_by': 'updated_at', 'sort': 'desc', 'per_page': 50}
+        merge_requests = self._make_gitlab_request(url, params) or []
+        for mr in merge_requests:
+            if mr.get('sha') == pipeline_sha or mr.get('merge_commit_sha') == pipeline_sha:
+                return mr
+        return None
+
+    def detect_branch_flow_violation(self, branch_name: str, merge_request: Optional[Dict]) -> int:
+        if not branch_name:
+            return 0
+        branch_lower = branch_name.lower()
+        if 'sit' in branch_lower:
+            if merge_request:
+                source_branch = merge_request.get('source_branch', '').lower()
+                target_branch = merge_request.get('target_branch', '').lower()
+                if 'sit' in target_branch and 'dev' in source_branch:
+                    return 0
+                else:
+                    return 1
             else:
-                job['actual_duration'] = job.get('duration', 0)
-                
-        return jobs
-    
-    def analyze_branch_protection(self, project_id: int) -> Dict:
-        """Analyze branch protection rules and compliance."""
-        protected_branches = get_protected_branches(project_id, logger)
-        all_branches = get_branches_in_repo(project_id, logger)
-        
-        protection_stats = {
-            'main_protected': False,
-            'dev_protected': False,
-            'sit_protected': False,
-            'protected_branch_count': len(protected_branches),
-            'total_branch_count': len(all_branches),
-            'protection_coverage': len(protected_branches) / len(all_branches) if all_branches else 0
-        }
-        
-        for branch in protected_branches:
-            name = branch['name']
-            if name == 'main':
-                protection_stats['main_protected'] = True
-            elif name == 'dev':
-                protection_stats['dev_protected'] = True
-            elif name == 'sit':
-                protection_stats['sit_protected'] = True
-                
-        return protection_stats
-    
-    def analyze_approval_rules(self, project_id: int) -> Dict:
-        """Analyze merge request approval rules."""
-        rules = get_approval_rules(project_id, logger)
-        
-        approval_stats = {
-            'has_approval_rules': len(rules) > 0,
-            'required_approvals': 0,
-            'approval_rule_count': len(rules),
-            'rules': []
-        }
-        
-        if rules:
-            approval_stats['required_approvals'] = max(r['approvals_required'] for r in rules)
-            approval_stats['rules'] = [{
-                'name': r['name'],
-                'approvals_required': r['approvals_required'],
-                'eligible_approvers': len(r['eligible_approvers'])
-            } for r in rules]
-            
-        return approval_stats
-    
-    def calculate_repository_health(self, pipeline_stats: Dict, branch_stats: Dict, approval_stats: Dict) -> float:
-        """Calculate a composite health score for the repository (0-100)."""
-        weights = {
-            'success_rate': 0.4,
-            'main_protected': 0.2,
-            'approval_rules': 0.2,
-            'test_coverage': 0.1,
-            'avg_duration': 0.1
-        }
-        
-        # Normalize values
-        success_score = pipeline_stats.get('success_rate', 0)
-        protection_score = 100 if branch_stats.get('main_protected', False) else 0
-        approval_score = 100 if approval_stats.get('has_approval_rules', False) else 0
-        coverage_score = (pipeline_stats.get('test_coverage', 0) or 0) * 100
-        duration_score = max(0, 100 - (pipeline_stats.get('avg_duration', 0) / 3600))  # Normalize hours to score
-        
-        # Calculate weighted score
-        health_score = (
-            weights['success_rate'] * success_score +
-            weights['main_protected'] * protection_score +
-            weights['approval_rules'] * approval_score +
-            weights['test_coverage'] * coverage_score +
-            weights['avg_duration'] * duration_score
-        )
-        
-        return min(100, max(0, health_score))
-    
-    def analyze_repository_worker(self, repo_data: Tuple[int, str, str, str, int, int]) -> Optional[Dict]:
+                return 1
+        elif 'main' in branch_lower or 'master' in branch_lower:
+            if merge_request:
+                source_branch = merge_request.get('source_branch', '').lower()
+                target_branch = merge_request.get('target_branch', '').lower()
+                if ('main' in target_branch or 'master' in target_branch) and 'sit' in source_branch:
+                    return 0
+                else:
+                    return 1
+            else:
+                return 1
+        elif 'dev' in branch_lower:
+            if merge_request:
+                source_branch = merge_request.get('source_branch', '').lower()
+                target_branch = merge_request.get('target_branch', '').lower()
+                if 'dev' in target_branch and 'dev' not in source_branch:
+                    return 0
+                else:
+                    return 1
+            else:
+                return 0
+        return 0
+
+    def collect_repository_data(self, repo_data: Tuple[int, str, str, str, str, str, int, int]) -> List[Dict]:
         """
-        Worker function for parallel repository analysis.
-        
-        Args:
-            repo_data: Tuple of (repo_id, repo_name, subdomain_name, domain_name, days_back, max_pipelines)
-        
-        Returns:
-            Analytics dictionary or None if analysis failed
+        repo_data: (repo_id, repo_name, subdomain_name, domain_name, domain_desc, subdomain_desc, days_back, max_pipelines)
         """
-        repo_id, repo_name, subdomain_name, domain_name, days_back, max_pipelines = repo_data
-        
+        repo_id, repo_name, subdomain_name, domain_name, domain_desc, subdomain_desc, days_back, max_pipelines = repo_data
         try:
-            # Pipeline analysis with limit
+            records = []
             pipelines = self.get_project_pipelines(repo_id, days_back, max_pipelines)
-            pipeline_stats = self._analyze_pipelines(pipelines, repo_id)
-            
-            # Branch protection analysis
-            branch_stats = self.analyze_branch_protection(repo_id)
-            
-            # Approval rules analysis
-            approval_stats = self.analyze_approval_rules(repo_id)
-            
-            # Calculate repository health
-            health_score = self.calculate_repository_health(pipeline_stats, branch_stats, approval_stats)
-            
-            analytics = {
-                'repo_id': repo_id,
-                'repo_name': repo_name,
-                'subdomain': subdomain_name,
-                'domain': domain_name,
-                'health_score': health_score,
-                'pipeline_stats': pipeline_stats,
-                'branch_stats': branch_stats,
-                'approval_stats': approval_stats,
-                'last_updated': datetime.now().isoformat()
-            }
-            
-            # Thread-safe progress tracking
+            for pipeline in pipelines:
+                merge_request = None
+                if pipeline.get('sha'):
+                    merge_request = self.get_merge_request_for_pipeline(repo_id, pipeline['sha'])
+                branch_flow_violation = self.detect_branch_flow_violation(pipeline.get('ref', ''), merge_request)
+                jobs = self.get_pipeline_jobs(repo_id, pipeline['id'])
+                base_record = {
+                    'domain': domain_name,
+                    'subdomain': subdomain_name,
+                    'repo_name': repo_name,
+                    'repo_id': repo_id,
+                    'domain_project_description': domain_desc,
+                    'subdomain_project_description': subdomain_desc,
+                    'pipeline_id': pipeline['id'],
+                    'pipeline_status': pipeline['status'],
+                    'pipeline_created_at': pipeline.get('created_at'),
+                    'pipeline_updated_at': pipeline.get('updated_at'),
+                    'pipeline_duration': pipeline.get('duration'),
+                    'branch_name': pipeline.get('ref'),
+                    'commit_sha': pipeline.get('sha'),
+                    'branch_flow_violation': branch_flow_violation,
+                    'merge_request_id': merge_request.get('id') if merge_request else None,
+                    'merge_request_source_branch': merge_request.get('source_branch') if merge_request else None,
+                    'merge_request_target_branch': merge_request.get('target_branch') if merge_request else None,
+                    'merge_request_state': merge_request.get('state') if merge_request else None,
+                }
+                if not jobs:
+                    record = base_record.copy()
+                    record.update({
+                        'job_name': None, 'job_status': None, 'job_duration': None,
+                        'job_stage': None, 'job_created_at': None, 'job_started_at': None,
+                        'job_finished_at': None, 'job_actual_duration': None
+                    })
+                    records.append(record)
+                else:
+                    for job in jobs:
+                        if any(excluded_job.lower() in job['name'].lower() for excluded_job in EXCLUDED_JOBS):
+                            continue
+                        record = base_record.copy()
+                        record.update({
+                            'job_name': job['name'],
+                            'job_status': job['status'],
+                            'job_duration': job.get('duration'),
+                            'job_stage': job.get('stage'),
+                            'job_created_at': job.get('created_at'),
+                            'job_started_at': job.get('started_at'),
+                            'job_finished_at': job.get('finished_at'),
+                            'job_actual_duration': job.get('actual_duration')
+                        })
+                        records.append(record)
             count = self._progress_counter.increment()
-            if count % 10 == 0:  # Log every 10th completion
-                logger.info(f"Completed analysis for {count} repositories")
-            
-            return analytics
-            
+            if count % 10 == 0:
+                logger.info(f"Completed data collection for {count} repositories")
+            return records
         except Exception as e:
-            logger.error(f"Error analyzing repository {repo_name} (ID: {repo_id}): {e}")
-            return None
-    
-    def analyze_repositories_parallel(self, repo_tasks: List[Tuple], batch_size: Optional[int] = None) -> None:
+            logger.error(f"Error collecting data for repository {repo_name} ({repo_id}): {e}")
+            return []
+
+    def collect_repositories_parallel(self, repo_tasks: List[Tuple], batch_size: Optional[int] = None) -> None:
         """
-        Analyze repositories in parallel batches to manage memory usage.
+        Collect data from repositories in parallel batches.
         
         Args:
-            repo_tasks: List of tuples for repository analysis
+            repo_tasks: List of tuples for repository data collection
             batch_size: Size of each batch (uses instance default if None)
         """
         if batch_size is None:
             batch_size = self.batch_size
             
         total_repos = len(repo_tasks)
-        logger.info(f"Starting parallel analysis of {total_repos} repositories in batches of {batch_size}")
+        logger.info(f"Starting parallel data collection from {total_repos} repositories in batches of {batch_size}")
         
         # Process repositories in batches
         for batch_start in range(0, total_repos, batch_size):
@@ -655,1124 +466,276 @@ class GitLabCICDAnalytics:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # Submit all tasks in current batch
                 future_to_repo = {
-                    executor.submit(self.analyze_repository_worker, repo_data): repo_data[1]  # repo_name for tracking
+                    executor.submit(self.collect_repository_data, repo_data): repo_data[1]  # repo_name for tracking
                     for repo_data in batch
                 }
                 
                 # Collect results as they complete
-                batch_results = []
+                batch_records = []
                 for future in as_completed(future_to_repo):
                     repo_name = future_to_repo[future]
                     try:
                         result = future.result()
                         if result:
-                            batch_results.append(result)
+                            batch_records.extend(result)
                     except Exception as e:
-                        logger.error(f"Repository analysis failed for {repo_name}: {e}")
+                        logger.error(f"Repository data collection failed for {repo_name}: {e}")
                 
                 # Thread-safe addition to main data structure
                 with self._data_lock:
-                    self.analytics_data.extend(batch_results)
+                    self.pipeline_data.extend(batch_records)
                 
             # Log batch completion and memory cleanup
-            logger.info(f"Completed batch {batch_start//batch_size + 1}. Total repositories analyzed: {len(self.analytics_data)}")
+            logger.info(f"Completed batch {batch_start//batch_size + 1}. Total records collected: {len(self.pipeline_data)}")
             
-            # Force garbage collection between batches to manage memory
+            # Force garbage collection between batches
             import gc
             gc.collect()
-    
+
+    def get_dataframe(self) -> pd.DataFrame:
+        """Convert collected data to pandas DataFrame."""
+        if not self.pipeline_data:
+            logger.warning("No data collected yet")
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(self.pipeline_data)
+        
+        # Convert date columns to datetime
+        date_columns = [
+            'pipeline_created_at', 'pipeline_updated_at', 
+            'job_created_at', 'job_started_at', 'job_finished_at'
+        ]
+        
+        for col in date_columns:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+        
+        logger.info(f"Created DataFrame with {len(df)} records and {len(df.columns)} columns")
+        return df
+
     def collect_repository_tasks(self, domains: List[Dict], days_back: int, max_pipelines: int) -> List[Tuple]:
         """
-        Collect all repository analysis tasks without executing them.
+        Collect all repository data collection tasks without executing them.
+        Ensures that each subdomain is correctly associated with its parent domain and
+        that domain/subdomain names are cleaned.
         
         Returns:
             List of tuples ready for parallel processing
         """
         repo_tasks = []
-        
+
+        def clean_name(name: Optional[str]) -> str:
+            """Standardize names: strip whitespace and title-case. Returns empty string if None."""
+            if not name:
+                return ""
+            return name.strip().title()
+
         for domain in domains:
-            logger.info(f"Collecting repositories from domain: {domain['name']}")
-            
-            subdomains = get_subgroups(domain['id'], logger)
-            for subdomain in subdomains:
+            top_domain_name = clean_name(domain['name'])
+            logger.info(f"Collecting repositories from domain: {top_domain_name}")
+
+            top_domain_description = get_group_description(domain['id'])
+
+            # Recursive subgroup fetching ensures we only get subgroups under this domain
+            subgroups = get_subgroups(domain['id'], logger) or []
+            if not subgroups:
+                subgroups = [{'id': domain['id'], 'name': None}]
+            for subdomain in subgroups:
+                subdomain_name = clean_name(subdomain.get('name'))
+
+                if not subdomain.get('name'):
+                    logger.warning(f"Subdomain with ID {subdomain['id']} has no name")
+
+                subdomain_description = get_group_description(subdomain['id'])
+
                 repositories = get_repositories(subdomain['id'], logger)
                 for repo in repositories:
+                    repo_name = clean_name(repo['name'])
+
+                    # Assign the correct parent domain
                     repo_tasks.append((
                         repo['id'],
-                        repo['name'],
-                        subdomain['name'],
-                        domain['name'],
+                        repo_name,
+                        subdomain_name,
+                        top_domain_name,
+                        top_domain_description,
+                        subdomain_description,
                         days_back,
                         max_pipelines
                     ))
-        
-        logger.info(f"Collected {len(repo_tasks)} repositories for analysis")
+
+        logger.info(f"Collected {len(repo_tasks)} repositories for data collection")
         return repo_tasks
+
+def collect_production_data(
+    collector: GitLabDataFrameCollector,
+    prod_group_id: Union[str, int],
+    exclude_domains: List[str],
+    days_back: int,
+    max_pipelines: int
+) -> pd.DataFrame:
+    """Collect all production data using parallel processing."""
+    logger.info(f"Running parallel production data collection for group ID: {prod_group_id}")
     
-
+    domains = get_subgroups(prod_group_id, logger)
+    filtered_domains = [d for d in domains if d['name'] not in exclude_domains]
+    logger.info(f"Filtered out {len(domains) - len(filtered_domains)} excluded domains from production collection")
     
-    def _analyze_pipelines(self, pipelines: List[Dict], project_id: int) -> Dict:
-        """Analyze pipeline metrics and job performance."""
-        if not pipelines:
-            return {
-                'total_pipelines': 0,
-                'success_rate': 0,
-                'avg_duration': 0,
-                'status_breakdown': {},
-                'test_coverage': None,
-                'job_stats': {},
-                'deployment_counts': {'success': 0, 'failed': 0}
-            }
-        
-        # Add deployment counts tracking
-        deployment_counts = {
-            'success': len([p for p in pipelines if p['status'] == 'success']),
-            'failed': len([p for p in pipelines if p['status'] in ('failed', 'canceled')])
-        }
-        
-        # Basic metrics
-        total_pipelines = len(pipelines)
-        successful_pipelines = len([p for p in pipelines if p['status'] == 'success'])
-        success_rate = (successful_pipelines / total_pipelines) * 100 if total_pipelines > 0 else 0
-        
-        # Duration analysis
-        durations = [p['duration'] for p in pipelines if p.get('duration')]
-        avg_duration = np.mean(durations) if durations else 0
-        
-        # Status breakdown
-        status_breakdown = defaultdict(int)
-        for pipeline in pipelines:
-            status_breakdown[pipeline['status']] += 1
-        
-        # Job performance analysis
-        job_stats = defaultdict(lambda: {
-            'count': 0,
-            'success_count': 0,
-            'durations': [],
-            'failure_rate': 0
-        })
-        
-        # Sample recent pipelines for detailed job analysis (limit to 5 for performance)
-        for pipeline in pipelines[:5]:
-            jobs = self.get_pipeline_jobs(project_id, pipeline['id'])
-            for job in jobs:
-                job_name = job['name']
-                job_stats[job_name]['count'] += 1
-                if job['status'] == 'success':
-                    job_stats[job_name]['success_count'] += 1
-                if job.get('actual_duration'):
-                    job_stats[job_name]['durations'].append(job['actual_duration'])
-        
-        # Calculate job-level metrics
-        for job_name, stats in job_stats.items():
-            if stats['count'] > 0:
-                stats['success_rate'] = (stats['success_count'] / stats['count']) * 100
-                stats['failure_rate'] = 100 - stats['success_rate']
-                if stats['durations']:
-                    stats['avg_duration'] = np.mean(stats['durations'])
-                    stats['duration_stddev'] = np.std(stats['durations'])
-                else:
-                    stats['avg_duration'] = 0
-                    stats['duration_stddev'] = 0
-        
-        return {
-            'total_pipelines': total_pipelines,
-            'success_rate': success_rate,
-            'avg_duration': avg_duration,
-            'status_breakdown': dict(status_breakdown),
-            'job_stats': dict(job_stats),
-            'test_coverage': self._get_test_coverage(project_id, pipelines),
-            'deployment_counts': deployment_counts
-        }
+    repo_tasks = collector.collect_repository_tasks(filtered_domains, days_back, max_pipelines)
+    collector.collect_repositories_parallel(repo_tasks)
     
-    def _get_test_coverage(self, project_id: int, pipelines: List[Dict]) -> Optional[float]:
-        """Get test coverage from the most recent successful pipeline."""
-        for pipeline in sorted(pipelines, key=lambda x: x.get('created_at', ''), reverse=True):
-            if pipeline['status'] == 'success':
-                test_report = self._make_gitlab_request(
-                    f"{gitlab_url}api/v4/projects/{project_id}/pipelines/{pipeline['id']}/test_report"
-                )
-                if test_report and test_report.get('test_suites'):
-                    return test_report['test_suites'][0].get('total_coverage')
-        return None
-    
-    def _categorize_by_pattern(self, repo_name: str) -> Optional[str]:
-        """Categorize repository by naming pattern."""
-        repo_name = repo_name.lower()
-        if 'raw' in repo_name or 'sdp_pattern_1' in repo_name:
-            return 'Pattern 1'
-        elif 'cdp' in repo_name or 'sdp_pattern_3' in repo_name:
-            return 'Pattern 3'
-        return None
+    return collector.get_dataframe()
 
-    def generate_domain_comparison_report(self, env: str, save_path: str = None) -> None:
-        """Generate comprehensive comparison report across domains."""
-        if not self.analytics_data:
-            logger.warning("No analytics data available for report generation")
-            return
-        
-        # Set default filename based on environment if not provided
-        if save_path is None:
-            save_path = f"reports/domain_comparison_{env}.html"
-        
-        # Determine title based on environment
-        env_title = "Production" if env=="prod" else "Non-Production"
-        
-        df = pd.DataFrame(self.analytics_data)
-        
-        # Extract nested values first
-        df['success_rate'] = df['pipeline_stats'].apply(lambda x: x.get('success_rate', 0) if isinstance(x, dict) else 0)
-        df['protection_coverage'] = df['branch_stats'].apply(lambda x: x.get('protection_coverage', 0) if isinstance(x, dict) else 0)
-        df['has_approval_rules'] = df['approval_stats'].apply(lambda x: x.get('has_approval_rules', False) if isinstance(x, dict) else False)
-        
-        # Domain-level aggregates
-        domain_stats = df.groupby('domain').agg({
-            'health_score': ['mean', 'median', 'std'],
-            'success_rate': 'mean',
-            'protection_coverage': 'mean',
-            'has_approval_rules': lambda x: (sum(x) / len(x)) * 100
-        }).round(2)
-        
-        # Flatten multi-index columns
-        domain_stats.columns = ['_'.join(col).strip() for col in domain_stats.columns.values]
-        
-        # Generate HTML report
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>GitLab CI/CD {env_title} Domain Comparison Report</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; }}
-                h1, h2, h3 {{ color: #2c3e50; }}
-                .header {{ background-color: #3498db; color: white; padding: 20px; text-align: center; }}
-                .section {{ margin-bottom: 30px; border-bottom: 1px solid #eee; padding-bottom: 20px; }}
-                table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-                th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-                th {{ background-color: #3498db; color: white; }}
-                tr:nth-child(even) {{ background-color: #f2f2f2; }}
-                .good {{ color: #27ae60; font-weight: bold; }}
-                .warning {{ color: #f39c12; font-weight: bold; }}
-                .bad {{ color: #e74c3c; font-weight: bold; }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1>GitLab CI/CD {env_title} Domain Comparison Report</h1>
-                <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            </div>
-            
-            <div class="section">
-                <h2>Domain Comparison</h2>
-                <table>
-                    <tr>
-                        <th>Domain</th>
-                        <th>Health Score</th>
-                        <th>Success Rate</th>
-                        <th>Branch Protection</th>
-                        <th>Approval Rules</th>
-                    </tr>
-        """
-        
-        # Add domain rows with conditional formatting
-        for domain, row in domain_stats.iterrows():
-            health_class = "good" if row['health_score_mean'] > 75 else "warning" if row['health_score_mean'] > 50 else "bad"
-            success_class = "good" if row['success_rate_mean'] > 80 else "warning" if row['success_rate_mean'] > 60 else "bad"
-            protection_class = "good" if row['protection_coverage_mean'] > 0.8 else "warning" if row['protection_coverage_mean'] > 0.5 else "bad"
-            approval_class = "good" if row['has_approval_rules_<lambda>'] > 80 else "warning" if row['has_approval_rules_<lambda>'] > 50 else "bad"
-            
-            html_content += f"""
-                <tr>
-                    <td>{domain}</td>
-                    <td class="{health_class}">{row['health_score_mean']}</td>
-                    <td class="{success_class}">{row['success_rate_mean']}%</td>
-                    <td class="{protection_class}">{row['protection_coverage_mean']*100:.0f}%</td>
-                    <td class="{approval_class}">{row['has_approval_rules_<lambda>']:.0f}%</td>
-                </tr>
-            """
-        
-        # Close HTML
-        html_content += """
-                </table>
-            </div>
-        </body>
-        </html>
-        """
-        
-        # Save file
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, 'w') as f:
-            f.write(html_content)
-        
-        logger.info(f"Domain comparison report saved to {save_path}")
-    
-    def generate_repository_health_dashboard(self, env: str, days_back: int, save_path: str = None) -> None:
-        """Generate interactive repository health dashboard with pattern comparison."""
-        if not self.analytics_data:
-            logger.warning("No analytics data available for dashboard generation")
-            return
-
-        # Set default filename based on environment if not provided
-        if save_path is None:
-            save_path = f"reports/repository_health_{env}.html"
-
-        # Determine environment
-        env_title = "Production" if env == "prod" else "Non-Production"
-        
-        df = pd.DataFrame(self.analytics_data)
-        
-        # Prepare data for all charts
-        # 1. Health Scores
-        health_scores = df.groupby('domain')['health_score'].mean().round(2).to_dict()
-        
-        # 2. Success Rates
-        success_rates = df.groupby('domain').apply(
-            lambda x: x['pipeline_stats'].apply(
-                lambda s: s.get('success_rate', 0) if isinstance(s, dict) else 0
-            ).mean()
-        ).round(2).to_dict()
-        
-        # 3. Protection Coverage
-        protection_coverage = df.groupby('domain').apply(
-            lambda x: x['branch_stats'].apply(
-                lambda b: b.get('protection_coverage', 0) if isinstance(b, dict) else 0
-            ).mean() * 100
-        ).round(2).to_dict()
-        
-        # 4. Approval Adoption
-        approval_adoption = df.groupby('domain').apply(
-            lambda x: x['approval_stats'].apply(
-                lambda a: a.get('has_approval_rules', False) if isinstance(a, dict) else False
-            ).mean() * 100
-        ).round(2).to_dict()
-        
-        # 5. Deployment Counts 
-        deployment_data = defaultdict(lambda: {'success': 0, 'failed': 0})
-        for entry in self.analytics_data:
-            domain = entry['domain']
-            counts = entry.get('pipeline_stats', {}).get('deployment_counts', {})
-            deployment_data[domain]['success'] += counts.get('success', 0)
-            deployment_data[domain]['failed'] += counts.get('failed', 0)
-        
-        # 6. Job Durations (Box Plot)
-        box_data = []
-        for entry in self.analytics_data:
-            domain = entry['domain']
-            pipeline_stats = entry.get('pipeline_stats', {})
-            job_stats = pipeline_stats.get('job_stats', {})
-            
-            for job_name, stats in job_stats.items():
-                if isinstance(stats, dict):
-                    durations = stats.get('durations', [])
-                    success_count = stats.get('success_count', 0)
-                    total_count = stats.get('count', 0)
-                    
-                    for d in durations:
-                        box_data.append({
-                            'domain': domain,
-                            'duration': d,
-                            'status': 'success' if success_count > (total_count - success_count) else 'failed'
-                        })
-
-        # 7. Pattern Comparison Data
-        pattern_data = []
-        for entry in self.analytics_data:
-            pattern = self._categorize_by_pattern(entry['repo_name'])
-            if not pattern:
-                continue
-            
-            counts = entry.get('pipeline_stats', {}).get('deployment_counts', {})
-            pattern_data.append({
-                'domain': entry['domain'],
-                'pattern': pattern,
-                'success': counts.get('success', 0),
-                'failed': counts.get('failed', 0),
-                'total': counts.get('success', 0) + counts.get('failed', 0)
-            })
-
-        # Generate HTML with all charts
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>{env_title} Repository Health Dashboard</title>
-            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }}
-                .header {{ background-color: #3498db; color: white; padding: 20px; text-align: center; border-radius: 5px; margin-bottom: 20px; }}
-                .dashboard {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }}
-                .chart {{ border: 1px solid #ddd; padding: 15px; border-radius: 5px; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                .full-width {{ grid-column: 1 / -1; }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1>{env_title} Repository Health Dashboard</h1>
-                <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            </div>
-
-            <div class="dashboard">
-                <div id="healthByDomain" class="chart"></div>
-                <div id="successRateByDomain" class="chart"></div>
-                <div id="protectionCoverageByDomain" class="chart"></div>
-                <div id="approvalRulesByDomain" class="chart"></div>
-                <div id="deploymentCountsByDomain" class="chart full-width"></div>
-                <div id="patternComparison" class="chart full-width"></div>
-                <div id="boxPlotDeployments" class="chart full-width"></div>
-            </div>
-
-            <script>
-                // Data from Python
-                var healthScores = {json.dumps(health_scores)};
-                var successRates = {json.dumps(success_rates)};
-                var protectionCoverage = {json.dumps(protection_coverage)};
-                var approvalAdoption = {json.dumps(approval_adoption)};
-                var deploymentData = {json.dumps(deployment_data)};
-                var boxData = {json.dumps(box_data)};
-                var patternData = {json.dumps(pattern_data)};
-
-                // Helper function for bar charts
-                function toChartData(dataDict, color = '#3498db') {{
-                    return {{
-                        x: Object.keys(dataDict),
-                        y: Object.values(dataDict),
-                        type: 'bar',
-                        marker: {{ color: color }}
-                    }};
-                }}
-
-                // Prepare deployment count data
-                function prepareDeploymentData() {{
-                    var domains = Object.keys(deploymentData);
-                    var successData = [];
-                    var failedData = [];
-                    
-                    domains.forEach(domain => {{
-                        successData.push(deploymentData[domain].success || 0);
-                        failedData.push(deploymentData[domain].failed || 0);
-                    }});
-                    
-                    return [
-                        {{
-                            x: domains,
-                            y: successData,
-                            name: 'Successful',
-                            type: 'bar',
-                            marker: {{ color: '#27ae60' }}
-                        }},
-                        {{
-                            x: domains,
-                            y: failedData,
-                            name: 'Failed',
-                            type: 'bar',
-                            marker: {{ color: '#e74c3c' }}
-                        }}
-                    ];
-                }}
-
-                // Prepare pattern comparison data
-                function preparePatternData() {{
-                    var pattern1Data = [];
-                    var pattern3Data = [];
-                    var domains = [...new Set(patternData.map(d => d.domain))];
-                    
-                    // Group data by domain and pattern
-                    var groupedData = {{}};
-                    domains.forEach(domain => {{
-                        groupedData[domain] = {{
-                            'Pattern 1': patternData.filter(d => d.domain === domain && d.pattern === 'Pattern 1').map(d => d.total),
-                            'Pattern 3': patternData.filter(d => d.domain === domain && d.pattern === 'Pattern 3').map(d => d.total)
-                        }};
-                    }});
-                    
-                    // Create traces
-                    var traces = [];
-                    for (var domain in groupedData) {{
-                        if (groupedData[domain]['Pattern 1'].length > 0) {{
-                            traces.push({{
-                                y: groupedData[domain]['Pattern 1'],
-                                x: Array(groupedData[domain]['Pattern 1'].length).fill(domain),
-                                name: 'Pattern 1',
-                                type: 'box',
-                                marker: {{ color: '#3498db' }},  // Blue for Pattern 1 
-                                showlegend: traces.length === 0
-                            }});
-                        }}
-                        
-                        if (groupedData[domain]['Pattern 3'].length > 0) {{
-                            traces.push({{
-                                y: groupedData[domain]['Pattern 3'],
-                                x: Array(groupedData[domain]['Pattern 3'].length).fill(domain),
-                                name: 'Pattern 3',
-                                type: 'box',
-                                marker: {{ color: '#f39c12' }},  // Orange for Pattern 3
-                                showlegend: traces.length === 1
-                            }});
-                        }}
-                    }}
-                    
-                    return traces;
-                }}
-
-                // Prepare box plot data
-                var successData = boxData.filter(d => d.status === "success");
-                var failedData = boxData.filter(d => d.status === "failed");
-                
-                var traceSuccess = {{
-                    y: successData.map(d => d.duration),
-                    x: successData.map(d => d.domain),
-                    name: 'Success',
-                    type: 'box',
-                    marker: {{ color: '#27ae60' }}
-                }};
-
-                var traceFailed = {{
-                    y: failedData.map(d => d.duration),
-                    x: failedData.map(d => d.domain),
-                    name: 'Failed',
-                    type: 'box',
-                    marker: {{ color: '#e74c3c' }}
-                }};
-
-                // Create all plots
-                Plotly.newPlot('healthByDomain', [toChartData(healthScores, '#2ecc71')], {{
-                    title: 'Average Health Score by Domain',
-                    yaxis: {{ title: 'Score (0-100)', range: [0, 100] }},
-                    xaxis: {{ title: 'Domain' }}
-                }});
-
-                Plotly.newPlot('successRateByDomain', [toChartData(successRates, '#3498db')], {{
-                    title: 'Pipeline Success Rate by Domain',
-                    yaxis: {{ title: 'Success Rate (%)', range: [0, 100] }},
-                    xaxis: {{ title: 'Domain' }}
-                }});
-
-                Plotly.newPlot('protectionCoverageByDomain', [toChartData(protectionCoverage, '#f39c12')], {{
-                    title: 'Branch Protection Coverage by Domain',
-                    yaxis: {{ title: 'Coverage (%)', range: [0, 100] }},
-                    xaxis: {{ title: 'Domain' }}
-                }});
-
-                Plotly.newPlot('approvalRulesByDomain', [toChartData(approvalAdoption, '#9b59b6')], {{
-                    title: 'Approval Rule Adoption by Domain',
-                    yaxis: {{ title: 'Adoption Rate (%)', range: [0, 100] }},
-                    xaxis: {{ title: 'Domain' }}
-                }});
-
-                Plotly.newPlot('deploymentCountsByDomain', prepareDeploymentData(), {{
-                    title: 'Deployment Counts by Domain (Last {days_back} Days)',
-                    yaxis: {{ title: 'Number of Deployments' }},
-                    xaxis: {{ title: 'Domain' }},
-                    barmode: 'stack'
-                }});
-
-                // Create pattern comparison plot if data exists
-                if (patternData && patternData.length > 0) {{
-                    Plotly.newPlot('patternComparison', preparePatternData(), {{
-                        title: 'Deployment Count Comparison: Pattern 1 vs Pattern 3',
-                        yaxis: {{ title: 'Number of Deployments' }},
-                        xaxis: {{ title: 'Domain' }},
-                        boxmode: 'group'
-                    }});
-                }} else {{
-                    document.getElementById('patternComparison').innerHTML = 
-                        '<p style="text-align: center; padding: 50px;">No pattern comparison data available</p>';
-                }}
-
-                // Only create box plot if we have data
-                if (boxData.length > 0) {{
-                    Plotly.newPlot('boxPlotDeployments', [traceSuccess, traceFailed], {{
-                        title: 'Job Duration Distribution by Domain and Status',
-                        yaxis: {{ title: 'Duration (seconds)' }},
-                        xaxis: {{ title: 'Domain' }},
-                        boxmode: 'group'
-                    }});
-                }} else {{
-                    document.getElementById('boxPlotDeployments').innerHTML = 
-                        '<p style="text-align: center; padding: 50px;">No duration data available for box plot</p>';
-                }}
-            </script>
-        </body>
-        </html>
-        """
-        
-        # Save file
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, 'w') as f:
-            f.write(html_content)
-        
-        logger.info(f"Repository health dashboard saved to {save_path}")
-
-    def upload_report_to_confluence(
-        self,
-        confluence_client: ConfluenceClient,
-        target_page_id: str,
-        report_path: str,
-        env: str,
-        days_back: int
-    ) -> bool:
-        """
-        Upload generated reports to Confluence with enhanced error handling.
-        """
-        try:
-            if not os.path.exists(report_path):
-                logger.error(f"Report file not found: {report_path}")
-                return False
-                
-            logger.info(f"Starting Confluence upload for {report_path}")
-            
-            # Use the confluence client's upload method
-            return confluence_client.upload_report_to_confluence(
-                target_page_id=target_page_id,
-                report_path=report_path,
-                env=env,
-                days_back=days_back
-            )
-        
-        except Exception as e:
-            logger.error(f"Error during Confluence upload: {str(e)}", exc_info=True)
-            return False
-
-    def generate_graph_images(self, env: str) -> Dict[str, str]:
-        """Generate and save all graph images for reports in reports/plots directory.
-        
-        Args:
-            env: Environment identifier ('prod' or 'nprod')
-            
-        Returns:
-            Dictionary mapping graph names to their file paths
-        """
-        if not self.analytics_data:
-            logger.warning("No analytics data available for graph generation")
-            return {}
-
-        plot_dir = os.path.join("reports", "plots")
-        os.makedirs(plot_dir, exist_ok=True)
-        image_paths = {}
-        df = pd.DataFrame(self.analytics_data)
-        
-        try:
-            # Define common plot style
-            plt.style.use('ggplot')
-            plt.rcParams['figure.facecolor'] = 'white'
-            
-            # 1. Health Score by Domain
-            plt.figure(figsize=(12, 8))
-            health_by_domain = df.groupby('domain')['health_score'].mean().sort_values()
-            health_path = os.path.join(plot_dir, f"health_score_{env}.png")
-            health_by_domain.plot(kind='barh', color=plt.cm.Greens(np.linspace(0.4, 0.9, len(health_by_domain))))
-            plt.title('Repository Health Score by Domain', pad=20)
-            plt.xlabel('Health Score (0-100)')
-            plt.xlim(0, 100)
-            plt.grid(axis='x', alpha=0.3)
-            plt.savefig(health_path, bbox_inches='tight', dpi=150)
-            plt.close()
-            image_paths['health_score'] = health_path
-
-            # 2. Pipeline Success Rate
-            plt.figure(figsize=(12, 8))
-            df['success_rate'] = df['pipeline_stats'].apply(lambda x: x.get('success_rate', 0))
-            success_path = os.path.join(plot_dir, f"success_rate_{env}.png")
-            df.groupby('domain')['success_rate'].mean().sort_values().plot(kind='bar', color=plt.cm.coolwarm(np.linspace(0.2, 0.8, len(df['domain'].unique()))))
-            plt.title('Pipeline Success Rate by Domain', pad=20)
-            plt.ylabel('Success Rate (%)')
-            plt.ylim(0, 100)
-            plt.xticks(rotation=45, ha='right')
-            plt.grid(axis='y', alpha=0.3)
-            plt.savefig(success_path, bbox_inches='tight', dpi=150)
-            plt.close()
-            image_paths['success_rate'] = success_path
-
-            # 3. Branch Protection Coverage
-            plt.figure(figsize=(12, 8))
-            df['protection'] = df['branch_stats'].apply(lambda x: x.get('protection_coverage', 0))
-            protection_path = os.path.join(plot_dir, f"branch_protection_{env}.png")
-            (df.groupby('domain')['protection'].mean()*100).sort_values().plot(kind='bar', color=plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(df['domain'].unique()))))
-            plt.title('Branch Protection Coverage by Domain', pad=20)
-            plt.ylabel('Protected Branches (%)')
-            plt.ylim(0, 100)
-            plt.xticks(rotation=45, ha='right')
-            plt.grid(axis='y', alpha=0.3)
-            plt.savefig(protection_path, bbox_inches='tight', dpi=150)
-            plt.close()
-            image_paths['branch_protection'] = protection_path
-
-            # 4. Approval Rules Adoption
-            plt.figure(figsize=(12, 8))
-            df['has_approvals'] = df['approval_stats'].apply(lambda x: x.get('has_approval_rules', False))
-            approvals_path = os.path.join(plot_dir, f"approval_rules_{env}.png")
-            (df.groupby('domain')['has_approvals'].mean()*100).sort_values().plot(kind='bar',color=plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(df['domain'].unique()))))
-            plt.title('Approval Rules Adoption by Domain', pad=20)
-            plt.ylabel('Repositories with Approval Rules (%)')
-            plt.ylim(0, 100)
-            plt.xticks(rotation=45, ha='right')
-            plt.grid(axis='y', alpha=0.3)
-            plt.savefig(approvals_path, bbox_inches='tight', dpi=150)
-            plt.close()
-            image_paths['approval_rules'] = approvals_path
-
-            # 5. Deployment Outcomes
-            plt.figure(figsize=(12, 8))
-            deployment_data = []
-            for domain in df['domain'].unique():
-                domain_df = df[df['domain'] == domain]
-                success = sum(ps.get('deployment_counts', {}).get('success', 0) for ps in domain_df['pipeline_stats'])
-                failed = sum(ps.get('deployment_counts', {}).get('failed', 0) for ps in domain_df['pipeline_stats'])
-                deployment_data.append({'domain': domain, 'success': success, 'failed': failed})
-            
-            deployments_path = os.path.join(plot_dir, f"deployments_{env}.png")
-            pd.DataFrame(deployment_data).set_index('domain').sort_values('success').plot(
-                kind='barh', stacked=True, color=['#2ecc71', '#e74c3c'])
-            plt.title('Deployment Outcomes by Domain', pad=20)
-            plt.xlabel('Number of Deployments')
-            plt.grid(axis='x', alpha=0.3)
-            plt.legend(title='Status', loc='lower right')
-            plt.savefig(deployments_path, bbox_inches='tight', dpi=150)
-            plt.close()
-            image_paths['deployments'] = deployments_path
-
-            # 6. Job Duration Distribution
-            job_data = []
-            for repo in self.analytics_data:
-                for job_name, stats in repo['pipeline_stats'].get('job_stats', {}).items():
-                    if isinstance(stats, dict) and 'durations' in stats:
-                        job_data.extend([(repo['domain'], job_name, d) for d in stats['durations']])
-            
-            if job_data:
-                plt.figure(figsize=(14, 8))
-                job_df = pd.DataFrame(job_data, columns=['domain', 'job', 'duration'])
-                top_jobs = job_df.groupby('job')['duration'].median().nlargest(10).index
-                durations_path = os.path.join(plot_dir, f"job_durations_{env}.png")
-                sns.boxplot(data=job_df[job_df['job'].isin(top_jobs)], x='duration', y='job', hue='domain')
-                plt.title('Top 10 Longest-Running Jobs by Duration', pad=20)
-                plt.xlabel('Duration (seconds)')
-                plt.ylabel('Job Name')
-                plt.grid(axis='x', alpha=0.3)
-                plt.savefig(durations_path, bbox_inches='tight', dpi=150)
-                plt.close()
-                image_paths['job_durations'] = durations_path
-
-            # 7. Pipeline Status Distribution (Updated with custom colors)
-            status_counts = defaultdict(int)
-            for repo in self.analytics_data:
-                for status, count in repo['pipeline_stats'].get('status_breakdown', {}).items():
-                    status_counts[status] += count
-            
-            if status_counts:
-                plt.figure(figsize=(10, 10))
-                status_path = os.path.join(plot_dir, f"pipeline_status_{env}.png")
-                
-                # Define custom colors for different pipeline statuses
-                status_color_map = {
-                    'success': '#27ae60',      # Green
-                    'failed': '#e74c3c',       # Red  
-                    'skipped': '#95a5a6',      # Grey
-                    'manual': '#f39c12',       # Orange
-                    'canceled': "#063437",     # Grey (same as skipped)
-                    'cancelled': "#0a494e",    # Grey (alternative spelling)
-                    'running': '#3498db',      # Blue
-                    'pending': '#f1c40f',      # Yellow
-                    'created': '#9b59b6',      # Purple
-                    'preparing': "#f9f9f9"     # Dark orange
-                }
-                
-                # Get the statuses and their counts
-                statuses = list(status_counts.keys())
-                counts = list(status_counts.values())
-                
-                # Create color list based on status names
-                colors = []
-                for status in statuses:
-                    # Use custom color if defined, otherwise use default
-                    colors.append(status_color_map.get(status.lower(), '#34495e'))
-                
-                # Create the pie chart with custom colors
-                plt.pie(counts, 
-                        labels=statuses,
-                        autopct='%1.1f%%',
-                        colors=colors,
-                        wedgeprops={'linewidth': 2, 'edgecolor': 'white'},
-                        startangle=90)
-                
-                plt.title('Overall Pipeline Status Distribution', pad=20, fontsize=14, fontweight='bold')
-                plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
-                
-                # Add a legend with better positioning
-                plt.legend(statuses, loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
-                
-                plt.savefig(status_path, bbox_inches='tight', dpi=150)
-                plt.close()
-                image_paths['pipeline_status'] = status_path
-
-            logger.info(f"Generated {len(image_paths)} graphs in {plot_dir} for {env} environment")
-            return image_paths
-
-        except Exception as e:
-            logger.error(f"Error generating graphs: {str(e)}", exc_info=True)
-            # Clean up any partial files
-            for path in image_paths.values():
-                try:
-                    os.remove(path)
-                except:
-                    pass
-            return {}
-
-    def generate_confluence_report_content(self, env: str, days_back: int, image_paths: Dict[str, str]) -> str:
-        """Generate Confluence report content with images from reports/plots.
-        
-        Args:
-            env: Environment identifier ('prod' or 'nprod')
-            days_back: Number of days analyzed
-            image_paths: Dictionary mapping graph names to file paths in reports/plots
-            
-        Returns:
-            Confluence storage format HTML with embedded images
-        """
-        env_title = "Production" if env == "prod" else "Non-Production"
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        plot_dir = os.path.join("reports", "plots")
-        
-        # Default image paths in reports/plots
-        default_images = {
-            'health_score': os.path.join(plot_dir, f"health_score_{env}.png"),
-            'success_rate': os.path.join(plot_dir, f"success_rate_{env}.png"),
-            'branch_protection': os.path.join(plot_dir, f"branch_protection_{env}.png"),
-            'approval_rules': os.path.join(plot_dir, f"approval_rules_{env}.png"),
-            'deployments': os.path.join(plot_dir, f"deployments_{env}.png"),
-            'job_durations': os.path.join(plot_dir, f"job_durations_{env}.png"),
-            'pipeline_status': os.path.join(plot_dir, f"pipeline_status_{env}.png")
-        }
-        
-        # Use provided paths or fall back to defaults
-        effective_paths = {**default_images, **image_paths}
-        
-        # Verify images exist
-        for name, path in effective_paths.items():
-            if not os.path.exists(path):
-                logger.warning(f"Missing graph image: {path}")
-                effective_paths[name] = None
-        
-        # Generate the report sections
-        sections = [
-            f"""<h2>{env_title} CI/CD Analytics Report</h2>
-            <p><strong>Generated:</strong> {timestamp}</p>
-            <p><strong>Analysis Period:</strong> Last {days_back} days</p>
-            <hr/>"""
-        ]
-        
-        # Add each graph section
-        report_sections = [
-            ('health_score', 'Repository Health Overview', 
-            'Composite score evaluating pipeline success, branch protection, approval rules, and performance.'),
-            ('success_rate', 'Pipeline Success Rates', 
-            'Percentage of pipelines that completed successfully across domains.'),
-            ('branch_protection', 'Branch Protection Status', 
-            'Percentage of branches with protection rules enabled (main branch should be 100%).'),
-            ('approval_rules', 'Approval Rules Adoption', 
-            'Percentage of repositories requiring approvals for merge requests.'),
-            ('deployments', 'Deployment Outcomes', 
-            'Total deployment attempts and their success/failure status.'),
-            ('job_durations', 'Job Performance', 
-            'Duration distribution of the top 10 longest-running jobs across domains.'),
-            ('pipeline_status', 'Pipeline Status Distribution', 
-            'Overall percentage of pipelines by status (success, failed, canceled, etc.).')
-        ]
-        
-        for graph_id, title, description in report_sections:
-            sections.append(f"""
-            <h3>{title}</h3>
-            {self._generate_image_macro(effective_paths[graph_id], title)}
-            <p>{description}</p>
-            """)
-        
-        sections.append("""<hr/><p><em>Report generated automatically by CI/CD Analytics</em></p>""")
-        
-        return "\n".join(sections)
-
-    def _generate_image_macro(self, image_path: Optional[str], alt_text: str) -> str:
-        """Generate Confluence image macro for a given image file."""
-        if image_path is None or not os.path.exists(image_path):
-            return f'<p style="color: red;">[Missing graph: {alt_text}]</p>'
-        
-        filename = os.path.basename(image_path)
-        return f"""
-        <ac:structured-macro ac:name="image">
-        <ac:parameter ac:name="alt">{alt_text}</ac:parameter>
-        <ac:parameter ac:name="width">800</ac:parameter>
-        <ac:rich-text-body>
-            <ac:image ac:alt="{alt_text}">
-            <ri:attachment ri:filename="{filename}"/>
-            </ac:image>
-        </ac:rich-text-body>
-        </ac:structured-macro>
-        """
-
-    def upload_report_to_confluence(
-                                        self,
-                                        confluence_client: ConfluenceClient,
-                                        target_page_id: str,
-                                        env: str,
-                                        days_back: int
-                                    ) -> bool:
-        """Upload generated graphs and report to Confluence."""
-        try:
-            # Generate all graphs
-            image_paths = self.generate_graph_images(env)
-            if not image_paths:
-                logger.error("No graphs generated for Confluence upload")
-                return False
-                
-            # Generate Confluence content
-            report_content = self.generate_confluence_report_content(env, days_back, image_paths)
-            
-            # Update page with new content
-            page = confluence_client.get_page(target_page_id)
-            if not page:
-                logger.error(f"Could not retrieve target page {target_page_id}")
-                return False
-                
-            update_result = confluence_client.update_page(
-                page_id=target_page_id,
-                title=page['title'],
-                content=report_content,
-                version=page['version']['number']
-            )
-            
-            if not update_result:
-                logger.error("Failed to update page content")
-                return False
-                
-            # Upload all images as attachments
-            for img_path in image_paths.values():
-                if not os.path.exists(img_path):
-                    logger.warning(f"Graph image not found: {img_path}")
-                    continue
-                    
-                attachment_result = confluence_client.attach_file(
-                    target_page_id,
-                    img_path,
-                    comment=f"{env_title} CI/CD Analytics graph",
-                    minor_edit=True
-                )
-                
-                if not attachment_result:
-                    logger.warning(f"Failed to attach image: {img_path}")
-                    
-            logger.info("Successfully updated Confluence page with graphs")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error during Confluence upload: {str(e)}", exc_info=True)
-            return False
-
-def _analyze_production_parallel(   
-                                    analytics: GitLabCICDAnalytics,
-                                    prod_group_id: Union[str, int],
-                                    days_back: int,
-                                    max_pipelines: int
-                                ) -> GitLabCICDAnalytics:
-    """Analyze all production repositories using parallel processing."""
-    logger.info(f"Running parallel production analysis for group ID: {prod_group_id}")
-    
-    domains = get_subgroups(prod_group_id, logger)  # 1st level groups
-    repo_tasks = analytics.collect_repository_tasks(domains, days_back, max_pipelines)
-    
-    # Process all repositories in parallel batches
-    analytics.analyze_repositories_parallel(repo_tasks)
-    
-    _generate_reports(analytics, "prod", days_back)
-    return analytics
-
-def _analyze_non_production_parallel(
-                                        analytics: GitLabCICDAnalytics,
-                                        domain_group_id: str,
-                                        exclude_domains: List[str],
-                                        days_back: int,
-                                        max_pipelines: int
-                                    ) -> GitLabCICDAnalytics:
-    """Analyze all non-production repositories using parallel processing."""
-    logger.info("Running parallel non-production analysis")
+def collect_non_production_data(
+    collector: GitLabDataFrameCollector,
+    domain_group_id: str,
+    exclude_domains: List[str],
+    days_back: int,
+    max_pipelines: int
+) -> pd.DataFrame:
+    """Collect all non-production data using parallel processing."""
+    logger.info("Running parallel non-production data collection")
     
     domains = get_subgroups(domain_group_id, logger)
-    # Filter out excluded domains
     filtered_domains = [d for d in domains if d['name'] not in exclude_domains]
     
-    repo_tasks = analytics.collect_repository_tasks(filtered_domains, days_back, max_pipelines)
+    repo_tasks = collector.collect_repository_tasks(filtered_domains, days_back, max_pipelines)
+    collector.collect_repositories_parallel(repo_tasks)
     
-    # Process all repositories in parallel batches
-    analytics.analyze_repositories_parallel(repo_tasks)
-    
-    _generate_reports(analytics, "nprod", days_back)
-    return analytics
-
-def _generate_reports(analytics: GitLabCICDAnalytics, env: str, days_back: int) -> Tuple[str, str]:
-    """Generate reports and return paths to both report files."""
-    if not analytics.analytics_data:
-        logger.warning("No repository data collected for analysis")
-        return None, None
-    
-    # Generate both reports
-    os.makedirs("reports", exist_ok=True)
-    
-    # Generate domain comparison report
-    domain_report_path = f"reports/domain_comparison_{env}.html"
-    analytics.generate_domain_comparison_report(env, domain_report_path)
-    
-    # Generate repository health dashboard
-    health_report_path = f"reports/repository_health_{env}.html"
-    analytics.generate_repository_health_dashboard(env, days_back, health_report_path)
-    
-    logger.info(f"Reports generated at:\n- {domain_report_path}\n- {health_report_path}")
-    return domain_report_path, health_report_path
+    return collector.get_dataframe()
 
 def main(
     days_back: int = 30,
     exclude_domains: List[str] = None,
-    max_pipelines_per_repo: int = 10,
+    max_pipelines_per_repo: int = 100,
     env: str = "prod",
     prod_group_id: Union[str, int] = "410115",
-    max_workers: int = 8,
-    batch_size: int = 40,
-    upload_to_confluence: bool = False,                 # ← Controls Confluence upload
-    upload_only: bool = False                           # ← Upload existing reports only
-) -> GitLabCICDAnalytics:
-    # Initialize default excluded domains
-    if exclude_domains is None:
-        exclude_domains = ['central-team-repository', 'Request-for-Change']
-    
-    try:
-        # Create reports directory structure
-        os.makedirs(os.path.join("reports", "plots"), exist_ok=True)
+    max_workers: int = 16,
+    batch_size: int = 80,
+    save_csv: bool = True,
+    csv_path: str = None,
+    skip_dad: bool = True
+) -> pd.DataFrame:
+        """
+        Main function to collect GitLab CI/CD data into a DataFrame and add projectID.
         
-        analytics = GitLabCICDAnalytics(max_workers=max_workers, batch_size=batch_size)
+        Returns:
+            pandas.DataFrame with comprehensive pipeline data
+        """
         
-        if not upload_only:
-            logger.info(f"Starting parallel GitLab CI/CD Analytics in {env} mode")
+        print(f"Starting GitLab CI/CD Data Collection with {max_workers} workers, batch size {batch_size}")
+        start_time = time.time()
+
+        if exclude_domains is None:
+            exclude_domains = [
+                'central-team-repository', 'Request-for-Change', 'External_Purchased_Data',
+                'Reference_Data', 'Non_GO_Data', "Prod_Ops"
+            ]
+        
+        try:
+            os.makedirs("reports", exist_ok=True)
             
-            domain_group_id = "384233"
+            collector = GitLabDataFrameCollector(max_workers=max_workers, batch_size=batch_size)
             
+            logger.info(f"Starting parallel GitLab CI/CD data collection in {env} mode")
+            
+            # Collect data based on environment
             if env == "prod":
-                analytics_result = _analyze_production_parallel(
-                    analytics=analytics,
+                df = collect_production_data(
+                    collector=collector,
                     prod_group_id=prod_group_id,
+                    exclude_domains=exclude_domains,
                     days_back=days_back,
                     max_pipelines=max_pipelines_per_repo
                 )
             else:
-                analytics_result = _analyze_non_production_parallel(
-                    analytics=analytics,
+                domain_group_id = "384233"
+                df = collect_non_production_data(
+                    collector=collector,
                     domain_group_id=domain_group_id,
                     exclude_domains=exclude_domains,
                     days_back=days_back,
                     max_pipelines=max_pipelines_per_repo
                 )
+
+            # Add projectID column
+            if not df.empty:
+                df = apply_projectID_mapping(df, mapping_path="subdomain_projectID_map.json")
+                if not skip_dad:
+                    df = add_dad_scores(df, config_path="config.json")
+
+
+            # Save DataFrame to CSV if requested
+            if save_csv and not df.empty:
+                if csv_path is None:
+                    csv_path = f"reports/pipeline_data_{env}_{days_back}days.csv"
+                
+                df.to_csv(csv_path, index=False)
+                logger.info(f"DataFrame saved to {csv_path}")
+                print(f"Data saved to: {csv_path}")
             
-            # Generate all graphs first
-            logger.info("Generating visualization graphs...")
-            image_paths = analytics.generate_graph_images(env)
-            if not image_paths:
-                logger.error("Failed to generate any graphs!")
-                return analytics
+            # Display summary statistics
+            if not df.empty:
+                print(f"\nDataFrame Summary:")
+                print(f"- Total records: {len(df):,}")
+                print(f"- Date range: {df['pipeline_created_at'].min()} to {df['pipeline_created_at'].max()}")
+                print(f"- Domains: {df['domain'].nunique()}")
+                print(f"- Repositories: {df['repo_name'].nunique()}")
+                print(f"- Unique pipelines: {df['pipeline_id'].nunique()}")
+                print(f"- Branch flow violations: {df['branch_flow_violation'].sum():,} ({df['branch_flow_violation'].mean()*100:.1f}%)")
+                
+                print(f"\nPipeline Status Distribution:")
+                status_counts = df['pipeline_status'].value_counts()
+                for status, count in status_counts.head().items():
+                    print(f"- {status}: {count:,} ({count/len(df)*100:.1f}%)")
             
-            # Then generate reports that reference these graphs
-            logger.info("Generating reports...")
-            domain_report_path, health_report_path = _generate_reports(analytics, env, days_back)
+            # Calculate and display runtime
+            end_time = time.time()
+            runtime_minutes = (end_time - start_time) / 60
+            print(f"\nScript runtime: {runtime_minutes:.1f} minutes")
+            logger.info(f"Script runtime: {runtime_minutes:.1f} minutes ({end_time - start_time:.1f} seconds)")
             
-        # Handle Confluence upload if requested
-        if upload_to_confluence or upload_only:
-            try:
-                config = load_config()
-                if not config.get('confluence'):
-                    raise ValueError("Missing 'confluence' section in config.json")
+            return df
                 
-                required_keys = ['page_id', 'base_url', 'auth']
-                if not all(k in config['confluence'] for k in required_keys):
-                    raise ValueError(f"Config missing required keys: {required_keys}")
-                
-                # Initialize Confluence client with proper auth
-                auth_config = config['confluence']['auth']
-                if auth_config['type'] == 'pat':
-                    confluence_client = ConfluenceClient(
-                        base_url=config['confluence']['base_url'],
-                        username='api',  # Dummy value, not used with PAT
-                        api_token=auth_config['token']
-                    )
-                else:
-                    raise ValueError("Only PAT authentication is currently supported")
-                
-                # Upload reports and images
-                if image_paths:
-                    logger.info("Uploading graphs to Confluence...")
-                    for img_path in image_paths.values():
-                        if os.path.exists(img_path):
-                            confluence_client.attach_file(
-                                config['confluence']['page_id'],
-                                img_path
-                            )
-                
-                if domain_report_path and os.path.exists(domain_report_path):
-                    confluence_client.upload_report_to_confluence(
-                        target_page_id=config['confluence']['page_id'],
-                        report_path=domain_report_path,
-                        env=env,
-                        days_back=days_back
-                    )
-                
-                logger.info("Confluence upload completed successfully")
-                
-            except Exception as e:
-                logger.error(f"Confluence upload failed: {str(e)}")
-                logger.info("Reports were still generated locally")
-        
-        return analytics
-            
-    except Exception as e:
-        logger.error(f"Error in main execution: {e}")
-        raise
+        except Exception as e:
+            end_time = time.time()
+            runtime_minutes = (end_time - start_time) / 60
+            print(f"\nScript runtime before error: {runtime_minutes:.1f} minutes")
+            logger.error(f"Error in main execution: {e}")
+            raise
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="GitLab CI/CD Data Collection")
     parser.add_argument("--env", type=str, default="prod", 
-                      help="Environment to run (default: prod)", 
-                      choices=["prod", "nprod"])
+                        help="Environment to run (default: prod)", 
+                        choices=["prod", "nprod"])
     parser.add_argument("--days_back", type=int, default=30,
-                      help="Number of days to analyze (default: 30)")
-    parser.add_argument("--max_pipelines_per_repo", type=int, default=10,
-                      help="Max pipelines per repo (default: 10)")
-    parser.add_argument("--max_workers", type=int, default=8, 
-                      help="Number of parallel workers (default: 8)")
-    parser.add_argument("--batch_size", type=int, default=40, 
-                      help="Batch size for processing (default: 40)")
-    parser.add_argument("--upload_only", action="store_true",
-                      help="Upload existing reports without regeneration")
-    parser.add_argument("--upload_confluence", action="store_true",
-                          help="Upload reports to Confluence (disabled by default)")
-    # parser.add_argument("--no_confluence", action="store_true",
-    #                   help="Skip Confluence upload")
-    parser.add_argument("--publish", action="store_true",
-                      help="Run confluence.py after analytics completes")
+                        help="Number of days to analyze (default: 30)")
+    parser.add_argument("--max_pipelines_per_repo", type=int, default=100,
+                        help="Max pipelines per repo (default: 100)")
+    parser.add_argument("--max_workers", type=int, default=16, 
+                          help="Number of parallel workers (default: 16)")
+    parser.add_argument("--batch_size", type=int, default=80, 
+                        help="Batch size for processing (default: 80)")
+    parser.add_argument("--csv_path", type=str,
+                         help="Custom path for CSV output file")
+    parser.add_argument("--no_csv", action="store_true",
+                        help="Skip saving CSV file")
+    parser.add_argument("--skip_dad", action="store_true", 
+                        help="Skip fetching DAD scores")
     
     args = parser.parse_args()
 
-    # Default behavior - production with upload unless explicitly disabled
-    upload_to_confluence = args.upload_confluence  # Only upload if flag is provided
-    
-    # # If non-prod environment requested, require explicit upload flag
-    # if args.env == "nprod":
-    #     upload_to_confluence = False
-
-    analytics_result = main(
+    df_result = main(
         env=args.env,
         days_back=args.days_back,
         max_pipelines_per_repo=args.max_pipelines_per_repo,
         max_workers=args.max_workers,
         batch_size=args.batch_size,
-        upload_to_confluence=upload_to_confluence,
-        upload_only=args.upload_only
+        save_csv=not args.no_csv,
+        csv_path=args.csv_path, 
+        skip_dad=args.skip_dad
     )
-
-    # Trigger confluence.py if --publish is set
-    if args.publish:
-        script_path = os.path.join(os.path.dirname(__file__), "confluence.py")
-        logger.info(f"Publishing to Confluence by running: {script_path}")
-        subprocess.run([sys.executable, script_path, "--env", args.env], check=True)
+    
+    print(f"\nData collection complete! DataFrame shape: {df_result.shape}")

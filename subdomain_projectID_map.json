@@ -1,0 +1,83 @@
+{
+    "Deliver": {
+        "appID": "1007175",
+        "subdomains": {
+            "Carriers": {"appID": "1007175"},
+            "Fulfillment Centers": {"appID": "1007175"},
+            "Shipment": {"appID": "1007175"},
+            "Inbound": {"appID": "1007175"},
+            "Outbound": {"appID": "1007175"},
+            "Trade": {"appID": "1007175"}
+        }
+    },
+    "E2E Supply Chain": {
+        "appID": "",
+        "subdomains": {
+            "ESG": {"appID": ""},
+            "Item Attribution": {"appID": "1007295"},
+            "Product Attribution": {"appID": "1007290"},
+            "Site Attribution": {"appID": "1007296"},
+            "Supplier Attribution": {"appID": "1007296"},
+            "Supply Chain Optimization": {"appID": ""}
+        }
+    },
+    "Engineering & Design": {
+        "appID": "1007301",
+        "subdomains": {
+            "Configure": {"appID": "1007301"},
+            "Design": {"appID": "1007301"},
+            "Lifecycle": {"appID": "1007301"},
+            "Pilot": {"appID": "1007301"},
+            "Quality": {"appID": "1007301"},
+            "Regulatory": {"appID": "1007301"},
+            "Testing": {"appID": "1007301"}
+        }
+    },
+    "External Purchased Data": {
+        "appID": "1007201",
+        "subdomains": {
+            "3rd Party Analysis": {"appID": "1007201"},
+            "Market Information": {"appID": "1007201"},
+            "News and Social Media": {"appID": "1007201"},
+            "Weather": {"appID": "1007201"}
+        }
+    },
+    "Make": {
+        "appID": "",
+        "subdomains": {
+            "Inventory": {"appID": "1007198"},
+            "Order Management": {"appID": "1007431"},
+            "Production": {"appID": "1007268"}
+        }
+    },
+    "Plan": {
+        "appID": "1007564",
+        "subdomains": {
+            "Build Plan": {"appID": "1007564"},
+            "Demand Plan": {"appID": "1007564"},
+            "S and OP": {"appID": "1007564"},
+            "Supply Chain": {"appID": "1007564"}
+        }
+    },
+    "Reference Data": {
+        "appID": "1007201",
+        "subdomains": {
+            "Calendar": {"appID": "1007201"},
+            "Chart of Accounts": {"appID": "1007201"},
+            "Currency Exchange": {"appID": "1007201"},
+            "Geography": {"appID": "1007201"}
+        }
+    },
+    "Source": {
+        "appID": "1006617",
+        "subdomains": {
+            "Commodity Management": {"appID": "1006617"},
+            "Contracting": {"appID": "1006617"},
+            "Global Ops Finance": {"appID": "1006617"},
+            "NPI": {"appID": "1006617"},
+            "P2P": {"appID": "1006617"},
+            "Supply Management": {"appID": "1006617"},
+            "Travel and Expenses": {"appID": "1006617"}
+        }
+    }
+}
