@@ -10,10 +10,7 @@ import matplotlib.colors as mcolors
 from datetime import datetime, timezone
 
 CORRECTIONS_MAP = {
-    'Shipment': 'Deliver',
-    'Demand Plan': 'Plan',
-    'Supplier Attribution': 'Plan',
-    'Design': 'Engineering And Design'
+    
 }
 
 
@@ -403,4 +400,5 @@ if __name__ == "__main__":
     parser.add_argument("csv_path", type=str, nargs="?", default=get_default_csv(),
                         help="Path to the pipeline data CSV")
     args = parser.parse_args()
+
     main(args.csv_path)
