@@ -13,14 +13,19 @@
       "token": "yourtoken"
     },
     "reports": {
+      "dad_url": "",
+      "dad_api": {
+        "base_url": "y",
+        "access_token": ""
+      },
       "publish_page_ids": {
         "prod": {
-          "domain_comparison": "pageid",
-          "repository_health": "pageid"
+          "domain_comparison": "xxxxxx",
+          "repository_health": "yyyyyyy"
         },
         "nprod": {
-          "domain_comparison": "pageid",
-          "repository_health": "pageid"
+          "domain_comparison": "uuuuuu",
+          "repository_health": "vvvvvvvvv"
         }
       }
     }
