@@ -38,12 +38,7 @@ from common.gitlab_utils import (
 )
 
 EXCLUDED_JOBS = [
-    "ctmem_cicd_pipeline", "publish-package", "retrieve-artifact-vault", 
-    "create-rfc_std", "deploy-prd-infra-config", "deploy-sit-infra-config", 
-    "deploy-infra-config", "SIT-deploy", "SIT_rollback", "dev_deploy", 
-    "dev_rollback", "SIT_deploy", "prod_deploy", " prod_deploy", 
-    "prod_deploy ", " prod_deploy ", "test-np", "prepare-requirements", 
-    "determine-package-source"
+   
 ]
 
 logger = set_logg_handlers_to_console_and_file("logs/cicd_analytics.log")
@@ -739,3 +734,4 @@ if __name__ == "__main__":
     )
     
     print(f"\nData collection complete! DataFrame shape: {df_result.shape}")
+
