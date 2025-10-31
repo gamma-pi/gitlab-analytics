@@ -2,6 +2,7 @@ import os
 import sys
 import requests
 import json
+import time
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -16,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from queue import Queue
 from io import BytesIO
+import subprocess
 
 import base64, mimetypes
 from urllib.parse import urljoin
@@ -35,10 +37,42 @@ from common.gitlab_utils import (
     process_subdomains
 )
 
+EXCLUDED_JOBS = [
+    "ctmem_cicd_pipeline",
+    
+    "publish-package",
+    "retrieve-artifact-vault",
+    
+    "create-rfc_std",
+
+    "deploy-prd-infra-config",
+    "deploy-sit-infra-config",
+    "deploy-infra-config",
+
+    "SIT-deploy",
+    "SIT-deploy",
+    "SIT_rollback",
+
+    "dev_deploy",
+    "dev_rollback",
+
+    "SIT_deploy",
+    "SIT_rollback"
+
+    "prod_deploy",
+    " prod_deploy",
+    "prod_deploy ",
+    " prod_deploy ",
+
+    "test-np",
+    "prepare-requirements",
+    "determine-package-source"    
+]
+
 logger = set_logg_handlers_to_console_and_file("logs/cicd_analytics.log")
 
 # GitLab API details
-gitlab_url = 'https://gitlab.com/'
+gitlab_url = 'https://gitlab.dell.com/'
 pem_file = "utils/cert.pem"
 
 # Visualization settings
@@ -399,7 +433,7 @@ class GitLabCICDAnalytics:
         self.analytics_data.clear()
         self.pipeline_data.clear()
 
-    def __init__(self, max_workers: int = 6, batch_size: int = 20):
+    def __init__(self, max_workers: int = 16, batch_size: int = 80):
         self.analytics_data = []
         self.pipeline_data = []
         self.job_data = []
@@ -412,33 +446,178 @@ class GitLabCICDAnalytics:
         self.batch_size = batch_size
         self._data_lock = threading.Lock()  # Protect shared data structures
         self._progress_counter = ThreadSafeCounter()
+        self.max_retries = 5   
+        self.base_delay = 1
+        self.max_delay = 300    
+    
+    def _calculate_backoff_delay(self, attempt: int, base_delay: float = None, max_delay: float = None) -> float:
+        """
+        Calculate exponential backoff delay with jitter.
         
-    def _make_gitlab_request(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Enhanced request handler with retry logic."""
-        try:
-            response = requests.get(
-                url,
-                headers=get_headers(),
-                params=params,
-                verify=pem_file,
-                timeout=30
-            )
+        Args:
+            attempt: Current attempt number (1-based)
+            base_delay: Base delay in seconds (uses instance default if None)
+            max_delay: Maximum delay in seconds (uses instance default if None)
             
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 60))
-                logger.warning(f"Rate limited. Retrying after {retry_after} seconds...")
-                time.sleep(retry_after)
-                return self._make_gitlab_request(url, params)
-            else:
-                logger.warning(f"API request failed: {url} - Status: {response.status_code}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error making request to {url}: {e}")
-            return None
+        Returns:
+            Delay in seconds with jitter applied
+        """
+        if base_delay is None:
+            base_delay = self.base_delay
+        if max_delay is None:
+            max_delay = self.max_delay
+            
+        # Exponential backoff: base_delay * (2 ^ (attempt - 1))
+        exponential_delay = base_delay * (2 ** (attempt - 1))
+        
+        # Cap at max_delay
+        capped_delay = min(exponential_delay, max_delay)
+        
+        # Add jitter (±25% randomization)
+        jitter = random.uniform(0.75, 1.25)
+        final_delay = capped_delay * jitter
+        
+        return final_delay
 
+    def _make_gitlab_request(self, url: str, params: Optional[Dict] = None, max_retries: int = None) -> Optional[Dict]:
+        """
+        Enhanced request handler with exponential backoff and jitter.
+        
+        Args:
+            url: URL to request
+            params: Query parameters
+            max_retries: Maximum number of retries (uses instance default if None)
+            
+        Returns:
+            JSON response or None if all retries failed
+        """
+        if max_retries is None:
+            max_retries = self.max_retries
+            
+        last_exception = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.get(
+                    url,
+                    headers=get_headers(),
+                    params=params,
+                    verify=pem_file,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                    
+                elif response.status_code == 429:  # Rate limited
+                    # Check if server provides Retry-After header
+                    server_retry_after = response.headers.get('Retry-After')
+                    
+                    if server_retry_after:
+                        try:
+                            server_delay = int(server_retry_after)
+                            logger.warning(f"Rate limited. Server suggests waiting {server_delay}s")
+                            # Use server suggestion but cap it at our max_delay
+                            delay = min(server_delay, self.max_delay)
+                        except ValueError:
+                            # If server header is invalid, use our backoff
+                            delay = self._calculate_backoff_delay(attempt)
+                    else:
+                        # No server guidance, use our backoff
+                        delay = self._calculate_backoff_delay(attempt)
+                    
+                    if attempt < max_retries:
+                        logger.warning(f"Rate limited on attempt {attempt}/{max_retries}. "
+                                     f"Retrying in {delay:.1f}s... URL: {url}")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Rate limited on final attempt {attempt}. Giving up. URL: {url}")
+                        return None
+                        
+                elif response.status_code in [502, 503, 504]:  # Server errors
+                    if attempt < max_retries:
+                        delay = self._calculate_backoff_delay(attempt)
+                        logger.warning(f"Server error {response.status_code} on attempt {attempt}/{max_retries}. "
+                                     f"Retrying in {delay:.1f}s... URL: {url}")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Server error {response.status_code} on final attempt {attempt}. "
+                                   f"Giving up. URL: {url}")
+                        return None
+                        
+                elif response.status_code == 404:
+                    # Don't retry 404s - the resource doesn't exist
+                    logger.warning(f"Resource not found (404): {url}")
+                    return None
+                    
+                elif response.status_code in [401, 403]:
+                    # Don't retry auth errors - fix the credentials instead
+                    logger.error(f"Authentication/Authorization error {response.status_code}: {url}")
+                    return None
+                    
+                else:
+                    # Other client errors - log and don't retry
+                    logger.warning(f"API request failed with status {response.status_code}: {url}")
+                    return None
+                    
+            except requests.exceptions.Timeout:
+                if attempt < max_retries:
+                    delay = self._calculate_backoff_delay(attempt)
+                    logger.warning(f"Timeout on attempt {attempt}/{max_retries}. "
+                                 f"Retrying in {delay:.1f}s... URL: {url}")
+                    time.sleep(delay)
+                    last_exception = "Timeout"
+                    continue
+                else:
+                    logger.error(f"Timeout on final attempt {attempt}. Giving up. URL: {url}")
+                    return None
+                    
+            except requests.exceptions.ConnectionError:
+                if attempt < max_retries:
+                    delay = self._calculate_backoff_delay(attempt)
+                    logger.warning(f"Connection error on attempt {attempt}/{max_retries}. "
+                                 f"Retrying in {delay:.1f}s... URL: {url}")
+                    time.sleep(delay)
+                    last_exception = "Connection error"
+                    continue
+                else:
+                    logger.error(f"Connection error on final attempt {attempt}. Giving up. URL: {url}")
+                    return None
+                    
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries:
+                    delay = self._calculate_backoff_delay(attempt)
+                    logger.warning(f"Request error on attempt {attempt}/{max_retries}: {e}. "
+                                 f"Retrying in {delay:.1f}s... URL: {url}")
+                    time.sleep(delay)
+                    last_exception = str(e)
+                    continue
+                else:
+                    logger.error(f"Request error on final attempt {attempt}: {e}. Giving up. URL: {url}")
+                    return None
+        
+        # If we get here, all retries failed
+        logger.error(f"All {max_retries} attempts failed for URL: {url}. Last error: {last_exception}")
+        return None
+
+    def configure_retries(self, max_retries: int = 5, base_delay: float = 1, max_delay: float = 300):
+        """
+        Configure retry behavior for API requests.
+        
+        Args:
+            max_retries: Maximum number of retry attempts
+            base_delay: Base delay for exponential backoff (seconds)
+            max_delay: Maximum delay cap (seconds)
+        """
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        
+        logger.info(f"Configured retries: max_retries={max_retries}, "
+                   f"base_delay={base_delay}s, max_delay={max_delay}s")
+        
     def get_project_pipelines(self, project_id: int, days_back: int = 30, max_pipelines: int = 10) -> List[Dict]:
         """Fetch pipelines with enhanced date filtering, pagination, and limits."""
         end_date = datetime.now()
@@ -557,28 +736,39 @@ class GitLabCICDAnalytics:
         """Calculate a composite health score for the repository (0-100)."""
         weights = {
             'success_rate': 0.4,
-            'main_protected': 0.2,
+            'branch_protection': 0.2,   # total branch protection contribution
             'approval_rules': 0.2,
             'test_coverage': 0.1,
             'avg_duration': 0.1
         }
-        
+
         # Normalize values
         success_score = pipeline_stats.get('success_rate', 0)
-        protection_score = 100 if branch_stats.get('main_protected', False) else 0
+
+        # Branch protection with custom weights (main=50%, sit=35%, dev=15%)
+        branch_weights = {
+            'main_protected': 0.50,
+            'sit_protected': 0.35,
+            'dev_protected': 0.15
+        }
+        protection_score = sum(
+            (100 if branch_stats.get(branch, False) else 0) * weight
+            for branch, weight in branch_weights.items()
+        )
+
         approval_score = 100 if approval_stats.get('has_approval_rules', False) else 0
         coverage_score = (pipeline_stats.get('test_coverage', 0) or 0) * 100
         duration_score = max(0, 100 - (pipeline_stats.get('avg_duration', 0) / 3600))  # Normalize hours to score
-        
+
         # Calculate weighted score
         health_score = (
             weights['success_rate'] * success_score +
-            weights['main_protected'] * protection_score +
+            weights['branch_protection'] * protection_score +
             weights['approval_rules'] * approval_score +
             weights['test_coverage'] * coverage_score +
             weights['avg_duration'] * duration_score
         )
-        
+
         return min(100, max(0, health_score))
     
     def analyze_repository_worker(self, repo_data: Tuple[int, str, str, str, int, int]) -> Optional[Dict]:
@@ -744,7 +934,7 @@ class GitLabCICDAnalytics:
         for pipeline in pipelines:
             status_breakdown[pipeline['status']] += 1
         
-        # Job performance analysis
+        # Job performance analysis with exclusion
         job_stats = defaultdict(lambda: {
             'count': 0,
             'success_count': 0,
@@ -757,13 +947,19 @@ class GitLabCICDAnalytics:
             jobs = self.get_pipeline_jobs(project_id, pipeline['id'])
             for job in jobs:
                 job_name = job['name']
+                
+                # CHANGE: Skip excluded jobs
+                if any(excluded_job.lower() in job_name.lower() for excluded_job in EXCLUDED_JOBS):
+                    logger.debug(f"Skipping excluded job: {job_name}")
+                    continue
+                    
                 job_stats[job_name]['count'] += 1
                 if job['status'] == 'success':
                     job_stats[job_name]['success_count'] += 1
                 if job.get('actual_duration'):
                     job_stats[job_name]['durations'].append(job['actual_duration'])
         
-        # Calculate job-level metrics
+        # Calculate job-level metrics (unchanged)
         for job_name, stats in job_stats.items():
             if stats['count'] > 0:
                 stats['success_rate'] = (stats['success_count'] / stats['count']) * 100
@@ -797,13 +993,28 @@ class GitLabCICDAnalytics:
         return None
     
     def _categorize_by_pattern(self, repo_name: str) -> Optional[str]:
-        """Categorize repository by naming pattern."""
-        repo_name = repo_name.lower()
-        if 'raw' in repo_name or 'sdp_pattern_1' in repo_name:
-            return 'Pattern 1'
-        elif 'cdp' in repo_name or 'sdp_pattern_3' in repo_name:
-            return 'Pattern 3'
+        """Categorize repository by naming pattern (inclusive, case-insensitive)."""
+        repo_name_lower = repo_name.lower()
+
+        pattern_1_keywords = [k.lower() for k in ['raw', 'sdp_pattern_1', 'pattern_1']]
+        pattern_3_keywords = [k.lower() for k in ['cdp', 'sdp_pattern_3', 'pattern_3']]
+
+        for keyword in pattern_1_keywords:
+            if keyword in repo_name_lower:
+                logger.debug(f"Repository '{repo_name}' matched Pattern 1 via keyword '{keyword}'")
+                return 'Pattern 1'
+
+        for keyword in pattern_3_keywords:
+            if keyword in repo_name_lower:
+                logger.debug(f"Repository '{repo_name}' matched Pattern 3 via keyword '{keyword}'")
+                return 'Pattern 3'
+
+        logger.info(
+            f"Repository '{repo_name}' did not match any pattern. Checked keywords: "
+            f"Pattern 1: {pattern_1_keywords}, Pattern 3: {pattern_3_keywords}"
+        )
         return None
+
 
     def generate_domain_comparison_report(self, env: str, save_path: str = None) -> None:
         """Generate comprehensive comparison report across domains."""
@@ -1256,62 +1467,130 @@ class GitLabCICDAnalytics:
             plt.style.use('ggplot')
             plt.rcParams['figure.facecolor'] = 'white'
             
-            # 1. Health Score by Domain
+            # 1. Health Score by Domain (Horizontal Bar Chart)
             plt.figure(figsize=(12, 8))
             health_by_domain = df.groupby('domain')['health_score'].mean().sort_values()
             health_path = os.path.join(plot_dir, f"health_score_{env}.png")
-            health_by_domain.plot(kind='barh', color=plt.cm.Greens(np.linspace(0.4, 0.9, len(health_by_domain))))
-            plt.title('Repository Health Score by Domain', pad=20)
+            colors = plt.cm.Greens(np.linspace(0.4, 0.9, len(health_by_domain)))
+            bars = health_by_domain.plot(kind='barh', color=colors)
+            plt.title('Repository Health Score by Domain', pad=20, fontsize=14, fontweight='bold')
             plt.xlabel('Health Score (0-100)')
+            plt.ylabel('Domain')
             plt.xlim(0, 100)
             plt.grid(axis='x', alpha=0.3)
+            
+            # Add value labels on bars
+            for i, (domain, score) in enumerate(health_by_domain.items()):
+                plt.text(score + 1, i, f'{score:.1f}', va='center', fontweight='bold')
+            
+            # Add legend explaining health score components
+            plt.figtext(0.02, 0.02, 
+                    'Health Score Components: Pipeline Success (40%) + Branch Protection (20%) + Approval Rules (20%) + Test Coverage (10%) + Performance (10%)',
+                    fontsize=9, style='italic', wrap=True)
+            
+            plt.tight_layout()
             plt.savefig(health_path, bbox_inches='tight', dpi=150)
             plt.close()
             image_paths['health_score'] = health_path
 
-            # 2. Pipeline Success Rate
+            # 2. Pipeline Success Rate (Vertical Bar Chart with Legend)
             plt.figure(figsize=(12, 8))
             df['success_rate'] = df['pipeline_stats'].apply(lambda x: x.get('success_rate', 0))
             success_path = os.path.join(plot_dir, f"success_rate_{env}.png")
-            df.groupby('domain')['success_rate'].mean().sort_values().plot(kind='bar', color=plt.cm.coolwarm(np.linspace(0.2, 0.8, len(df['domain'].unique()))))
-            plt.title('Pipeline Success Rate by Domain', pad=20)
+            success_data = df.groupby('domain')['success_rate'].mean().sort_values()
+            colors = plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(success_data)))
+            
+            bars = success_data.plot(kind='bar', color=colors)
+            plt.title('Pipeline Success Rate by Domain', pad=20, fontsize=14, fontweight='bold')
+            plt.xlabel('Domain')
             plt.ylabel('Success Rate (%)')
             plt.ylim(0, 100)
             plt.xticks(rotation=45, ha='right')
             plt.grid(axis='y', alpha=0.3)
+            
+            # Add value labels on bars
+            for i, (domain, rate) in enumerate(success_data.items()):
+                plt.text(i, rate + 1, f'{rate:.1f}%', ha='center', va='bottom', fontweight='bold')
+            
+            # Add color legend
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor='red', alpha=0.7, label='Poor (0-60%)'),
+                Patch(facecolor='yellow', alpha=0.7, label='Fair (60-80%)'),
+                Patch(facecolor='green', alpha=0.7, label='Good (80-100%)')
+            ]
+            plt.legend(handles=legend_elements, loc='upper left', title='Success Rate Categories')
+            
+            plt.tight_layout()
             plt.savefig(success_path, bbox_inches='tight', dpi=150)
             plt.close()
             image_paths['success_rate'] = success_path
 
-            # 3. Branch Protection Coverage
+            # 3. Branch Protection Coverage (with Legend)
             plt.figure(figsize=(12, 8))
             df['protection'] = df['branch_stats'].apply(lambda x: x.get('protection_coverage', 0))
             protection_path = os.path.join(plot_dir, f"branch_protection_{env}.png")
-            (df.groupby('domain')['protection'].mean()*100).sort_values().plot(kind='bar', color=plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(df['domain'].unique()))))
-            plt.title('Branch Protection Coverage by Domain', pad=20)
+            protection_data = (df.groupby('domain')['protection'].mean()*100).sort_values()
+            colors = plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(protection_data)))
+            
+            bars = protection_data.plot(kind='bar', color=colors)
+            plt.title('Branch Protection Coverage by Domain', pad=20, fontsize=14, fontweight='bold')
+            plt.xlabel('Domain')
             plt.ylabel('Protected Branches (%)')
             plt.ylim(0, 100)
             plt.xticks(rotation=45, ha='right')
             plt.grid(axis='y', alpha=0.3)
+            
+            # Add value labels
+            for i, (domain, coverage) in enumerate(protection_data.items()):
+                plt.text(i, coverage + 1, f'{coverage:.1f}%', ha='center', va='bottom', fontweight='bold')
+            
+            # Add legend
+            legend_elements = [
+                Patch(facecolor='red', alpha=0.7, label='Low (0-50%)'),
+                Patch(facecolor='yellow', alpha=0.7, label='Medium (50-80%)'),
+                Patch(facecolor='blue', alpha=0.7, label='High (80-100%)')
+            ]
+            plt.legend(handles=legend_elements, loc='upper left', title='Protection Coverage')
+            
+            plt.tight_layout()
             plt.savefig(protection_path, bbox_inches='tight', dpi=150)
             plt.close()
             image_paths['branch_protection'] = protection_path
 
-            # 4. Approval Rules Adoption
+            # 4. Approval Rules Adoption (with Legend)
             plt.figure(figsize=(12, 8))
             df['has_approvals'] = df['approval_stats'].apply(lambda x: x.get('has_approval_rules', False))
             approvals_path = os.path.join(plot_dir, f"approval_rules_{env}.png")
-            (df.groupby('domain')['has_approvals'].mean()*100).sort_values().plot(kind='bar',color=plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(df['domain'].unique()))))
-            plt.title('Approval Rules Adoption by Domain', pad=20)
+            approval_data = (df.groupby('domain')['has_approvals'].mean()*100).sort_values()
+            colors = plt.cm.Purples(np.linspace(0.4, 0.9, len(approval_data)))
+            
+            bars = approval_data.plot(kind='bar', color=colors)
+            plt.title('Approval Rules Adoption by Domain', pad=20, fontsize=14, fontweight='bold')
+            plt.xlabel('Domain')
             plt.ylabel('Repositories with Approval Rules (%)')
             plt.ylim(0, 100)
             plt.xticks(rotation=45, ha='right')
             plt.grid(axis='y', alpha=0.3)
+            
+            # Add value labels
+            for i, (domain, adoption) in enumerate(approval_data.items()):
+                plt.text(i, adoption + 1, f'{adoption:.1f}%', ha='center', va='bottom', fontweight='bold')
+            
+            # Add legend
+            legend_elements = [
+                Patch(facecolor='lightgray', alpha=0.7, label='No Rules (0%)'),
+                Patch(facecolor='mediumpurple', alpha=0.7, label='Partial (1-99%)'),
+                Patch(facecolor='darkviolet', alpha=0.7, label='Full Coverage (100%)')
+            ]
+            plt.legend(handles=legend_elements, loc='upper left', title='Approval Rule Adoption')
+            
+            plt.tight_layout()
             plt.savefig(approvals_path, bbox_inches='tight', dpi=150)
             plt.close()
             image_paths['approval_rules'] = approvals_path
 
-            # 5. Deployment Outcomes
+            # 5. Deployment Outcomes (Already has legend, but improved positioning)
             plt.figure(figsize=(12, 8))
             deployment_data = []
             for domain in df['domain'].unique():
@@ -1321,17 +1600,29 @@ class GitLabCICDAnalytics:
                 deployment_data.append({'domain': domain, 'success': success, 'failed': failed})
             
             deployments_path = os.path.join(plot_dir, f"deployments_{env}.png")
-            pd.DataFrame(deployment_data).set_index('domain').sort_values('success').plot(
-                kind='barh', stacked=True, color=['#2ecc71', '#e74c3c'])
-            plt.title('Deployment Outcomes by Domain', pad=20)
+            deployment_df = pd.DataFrame(deployment_data).set_index('domain').sort_values('success')
+            ax = deployment_df.plot(kind='barh', stacked=True, color=['#27ae60', '#e74c3c'], figsize=(12, 8))
+            plt.title('Deployment Outcomes by Domain', pad=20, fontsize=14, fontweight='bold')
             plt.xlabel('Number of Deployments')
+            plt.ylabel('Domain')
             plt.grid(axis='x', alpha=0.3)
-            plt.legend(title='Status', loc='lower right')
+            
+            # Improve legend
+            plt.legend(title='Deployment Status', labels=['Successful', 'Failed'], 
+                    loc='lower right', framealpha=0.9, title_fontsize=12)
+            
+            # Add total counts as annotations
+            for i, (domain, row) in enumerate(deployment_df.iterrows()):
+                total = row['success'] + row['failed']
+                plt.text(total + max(deployment_df.sum(axis=1)) * 0.01, i, 
+                        f'Total: {total}', va='center', fontweight='bold')
+            
+            plt.tight_layout()
             plt.savefig(deployments_path, bbox_inches='tight', dpi=150)
             plt.close()
             image_paths['deployments'] = deployments_path
 
-            # 6. Job Duration Distribution
+            # 6. Job Duration Distribution (Improved legend)
             job_data = []
             for repo in self.analytics_data:
                 for job_name, stats in repo['pipeline_stats'].get('job_stats', {}).items():
@@ -1343,16 +1634,28 @@ class GitLabCICDAnalytics:
                 job_df = pd.DataFrame(job_data, columns=['domain', 'job', 'duration'])
                 top_jobs = job_df.groupby('job')['duration'].median().nlargest(10).index
                 durations_path = os.path.join(plot_dir, f"job_durations_{env}.png")
-                sns.boxplot(data=job_df[job_df['job'].isin(top_jobs)], x='duration', y='job', hue='domain')
-                plt.title('Top 10 Longest-Running Jobs by Duration', pad=20)
+                
+                ax = sns.boxplot(data=job_df[job_df['job'].isin(top_jobs)], x='duration', y='job', hue='domain')
+                plt.title('Top 10 Longest-Running Jobs by Duration', pad=20, fontsize=14, fontweight='bold')
                 plt.xlabel('Duration (seconds)')
                 plt.ylabel('Job Name')
                 plt.grid(axis='x', alpha=0.3)
+                
+                # Improve legend positioning and add explanation
+                plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0, 
+                        framealpha=0.9, fontsize=10, title='Domain', title_fontsize=12)
+                
+                # Add explanation text
+                plt.figtext(0.02, 0.02, 
+                        'Box plots show median (center line), quartiles (box edges), and outliers (points)',
+                        fontsize=9, style='italic')
+                
+                plt.tight_layout()
                 plt.savefig(durations_path, bbox_inches='tight', dpi=150)
                 plt.close()
                 image_paths['job_durations'] = durations_path
 
-            # 7. Pipeline Status Distribution (Updated with custom colors)
+            # 7. Pipeline Status Distribution (Already has good legend, minor improvements)
             status_counts = defaultdict(int)
             for repo in self.analytics_data:
                 for status, count in repo['pipeline_stats'].get('status_breakdown', {}).items():
@@ -1364,49 +1667,147 @@ class GitLabCICDAnalytics:
                 
                 # Define custom colors for different pipeline statuses
                 status_color_map = {
-                    'success': '#27ae60',      # Green
-                    'failed': '#e74c3c',       # Red  
-                    'skipped': '#95a5a6',      # Grey
-                    'manual': '#f39c12',       # Orange
-                    'canceled': "#063437",     # Grey (same as skipped)
-                    'cancelled': "#0a494e",    # Grey (alternative spelling)
-                    'running': '#3498db',      # Blue
-                    'pending': '#f1c40f',      # Yellow
-                    'created': '#9b59b6',      # Purple
-                    'preparing': "#f9f9f9"     # Dark orange
+                    'success': '#27ae60',      'failed': '#e74c3c',       'skipped': '#95a5a6',      
+                    'manual': '#f39c12',       'canceled': "#063437",     'cancelled': "#0a494e",    
+                    'running': '#3498db',      'pending': '#f1c40f',      'created': '#9b59b6',      
+                    'preparing': "#f9f9f9"
                 }
                 
-                # Get the statuses and their counts
                 statuses = list(status_counts.keys())
                 counts = list(status_counts.values())
+                colors = [status_color_map.get(status.lower(), '#34495e') for status in statuses]
                 
-                # Create color list based on status names
-                colors = []
-                for status in statuses:
-                    # Use custom color if defined, otherwise use default
-                    colors.append(status_color_map.get(status.lower(), '#34495e'))
-                
-                # Create the pie chart with custom colors
-                plt.pie(counts, 
-                        labels=statuses,
-                        autopct='%1.1f%%',
-                        colors=colors,
-                        wedgeprops={'linewidth': 2, 'edgecolor': 'white'},
-                        startangle=90)
+                wedges, texts, autotexts = plt.pie(counts, labels=statuses, autopct='%1.1f%%', colors=colors,
+                                                wedgeprops={'linewidth': 2, 'edgecolor': 'white'}, startangle=90)
                 
                 plt.title('Overall Pipeline Status Distribution', pad=20, fontsize=14, fontweight='bold')
-                plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
+                plt.axis('equal')
                 
-                # Add a legend with better positioning
-                plt.legend(statuses, loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
+                # Enhanced legend with counts
+                legend_labels = [f'{status}: {count}' for status, count in zip(statuses, counts)]
+                plt.legend(wedges, legend_labels, title="Status (Count)", loc="center left", 
+                        bbox_to_anchor=(1, 0, 0.5, 1), fontsize=10, title_fontsize=12)
                 
+                plt.tight_layout()
                 plt.savefig(status_path, bbox_inches='tight', dpi=150)
                 plt.close()
                 image_paths['pipeline_status'] = status_path
 
-            logger.info(f"Generated {len(image_paths)} graphs in {plot_dir} for {env} environment")
-            return image_paths
+            # 8. SDP Pattern Deployment Count Comparison (Already has comprehensive legend)
+            logger.info("Generating SDP Pattern deployment comparison graph...")
+            pattern_deployment_data = []
 
+            for repo in self.analytics_data:
+                pattern = self._categorize_by_pattern(repo['repo_name'])
+                if pattern in ['Pattern 1', 'Pattern 3']:
+                    pipeline_stats = repo.get('pipeline_stats', {})
+                    deployment_counts = pipeline_stats.get('deployment_counts', {})
+                    
+                    pattern_deployment_data.append({
+                        'domain': repo['domain'],
+                        'pattern': pattern,
+                        'successful': deployment_counts.get('success', 0),
+                        'failed': deployment_counts.get('failed', 0),
+                        'repo_name': repo['repo_name']
+                    })
+
+            pattern_path = os.path.join(plot_dir, f"pattern_comparison_{env}.png")
+
+            if pattern_deployment_data:
+                pattern_df = pd.DataFrame(pattern_deployment_data)
+                pattern_agg = pattern_df.groupby(['domain', 'pattern']).agg({
+                    'successful': 'sum', 'failed': 'sum'
+                }).reset_index()
+                
+                fig, ax = plt.subplots(figsize=(14, 8))
+                domains = sorted(pattern_agg['domain'].unique())
+                bar_width = 0.35
+                x_pos = np.arange(len(domains))
+                
+                # Colors for patterns and success/failure
+                pattern1_success_color = '#2980b9'  # Darker blue
+                pattern1_failed_color = '#3498db'   # Lighter blue
+                pattern3_success_color = '#d35400'  # Darker orange
+                pattern3_failed_color = '#e67e22'   # Lighter orange
+
+                # Prepare data for each domain
+                pattern1_data = pattern_agg[pattern_agg['pattern'] == 'Pattern 1']
+                pattern3_data = pattern_agg[pattern_agg['pattern'] == 'Pattern 3']
+                
+                pattern1_success = []
+                pattern1_failed = []
+                pattern3_success = []
+                pattern3_failed = []
+                
+                for domain in domains:
+                    # Pattern 1 data
+                    p1_domain_data = pattern1_data[pattern1_data['domain'] == domain]
+                    if not p1_domain_data.empty:
+                        pattern1_success.append(p1_domain_data['successful'].iloc[0])
+                        pattern1_failed.append(p1_domain_data['failed'].iloc[0])
+                    else:
+                        pattern1_success.append(0)
+                        pattern1_failed.append(0)
+                    
+                    # Pattern 3 data
+                    p3_domain_data = pattern3_data[pattern3_data['domain'] == domain]
+                    if not p3_domain_data.empty:
+                        pattern3_success.append(p3_domain_data['successful'].iloc[0])
+                        pattern3_failed.append(p3_domain_data['failed'].iloc[0])
+                    else:
+                        pattern3_success.append(0)
+                        pattern3_failed.append(0)
+
+                # Create stacked bars
+                p1_bottom = ax.bar(x_pos - bar_width/2, pattern1_success, bar_width, 
+                            label='Pattern 1 - Successful', color=pattern1_success_color)
+                p1_top = ax.bar(x_pos - bar_width/2, pattern1_failed, bar_width, 
+                            bottom=pattern1_success, label='Pattern 1 - Failed', color=pattern1_failed_color)
+                p3_bottom = ax.bar(x_pos + bar_width/2, pattern3_success, bar_width, 
+                                label='Pattern 3 - Successful', color=pattern3_success_color)
+                p3_top = ax.bar(x_pos + bar_width/2, pattern3_failed, bar_width, 
+                                bottom=pattern3_success, label='Pattern 3 - Failed', color=pattern3_failed_color)
+                
+                ax.set_title('Deployment Count Comparison: Pattern 1 vs Pattern 3', 
+                            pad=20, fontsize=14, fontweight='bold')
+                ax.set_xlabel('Domain', fontsize=12)
+                ax.set_ylabel('Number of Deployments', fontsize=12)
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(domains, rotation=45, ha='right')
+                ax.grid(axis='y', alpha=0.3)
+                
+                # Enhanced legend with pattern explanation
+                legend = ax.legend(loc='upper left', framealpha=0.9, fontsize=10, title='Pattern Type & Status', title_fontsize=12)
+                
+                # Add pattern explanation
+                plt.figtext(0.02, 0.02, 
+                        'Pattern 1: Raw data repositories | Pattern 3: CDP/processed data repositories',
+                        fontsize=9, style='italic', wrap=True)
+                
+                plt.tight_layout()
+                plt.savefig(pattern_path, bbox_inches='tight', dpi=150)
+                plt.close()
+                
+                total_pattern_repos = len(pattern_df['repo_name'].unique()) if not pattern_df.empty else 0
+                logger.info(f"Generated Pattern deployment comparison with {total_pattern_repos} repositories")
+                
+            else:
+                # Placeholder plot with explanation
+                plt.figure(figsize=(10, 6))
+                plt.text(0.5, 0.5, "No Pattern 1 or Pattern 3 data available\n\nPattern 1: RAW or SDP_1 data repositories\nPattern 3: CDP or SDP_3 data repositories",
+                        ha='center', va='center', fontsize=14, 
+                        bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+                plt.axis("off")
+                plt.title('Deployment Count Comparison: Pattern 1 vs Pattern 3', 
+                        pad=20, fontsize=14, fontweight='bold')
+                plt.savefig(pattern_path, bbox_inches='tight', dpi=150)
+                plt.close()
+                logger.warning("No Pattern 1 or Pattern 3 repositories found - generated placeholder graph")
+
+            image_paths['pattern_comparison'] = pattern_path
+            
+            return image_paths
+            
         except Exception as e:
             logger.error(f"Error generating graphs: {str(e)}", exc_info=True)
             # Clean up any partial files
@@ -1440,7 +1841,8 @@ class GitLabCICDAnalytics:
             'approval_rules': os.path.join(plot_dir, f"approval_rules_{env}.png"),
             'deployments': os.path.join(plot_dir, f"deployments_{env}.png"),
             'job_durations': os.path.join(plot_dir, f"job_durations_{env}.png"),
-            'pipeline_status': os.path.join(plot_dir, f"pipeline_status_{env}.png")
+            'pipeline_status': os.path.join(plot_dir, f"pipeline_status_{env}.png"),
+            'pattern_comparison': os.path.join(plot_dir, f"pattern_comparison_{env}.png")  
         }
         
         # Use provided paths or fall back to defaults
@@ -1475,7 +1877,9 @@ class GitLabCICDAnalytics:
             ('job_durations', 'Job Performance', 
             'Duration distribution of the top 10 longest-running jobs across domains.'),
             ('pipeline_status', 'Pipeline Status Distribution', 
-            'Overall percentage of pipelines by status (success, failed, canceled, etc.).')
+            'Overall percentage of pipelines by status (success, failed, canceled, etc.).'),
+            ('pattern_comparison', 'Pattern Comparison',  
+            'Success rate comparison between Pattern_1 and Pattern_3 repositories across domains.')
         ]
         
         for graph_id, title, description in report_sections:
@@ -1568,6 +1972,7 @@ class GitLabCICDAnalytics:
 def _analyze_production_parallel(   
                                     analytics: GitLabCICDAnalytics,
                                     prod_group_id: Union[str, int],
+                                    exclude_domains: List[str],  # Add this parameter
                                     days_back: int,
                                     max_pipelines: int
                                 ) -> GitLabCICDAnalytics:
@@ -1575,7 +1980,12 @@ def _analyze_production_parallel(
     logger.info(f"Running parallel production analysis for group ID: {prod_group_id}")
     
     domains = get_subgroups(prod_group_id, logger)  # 1st level groups
-    repo_tasks = analytics.collect_repository_tasks(domains, days_back, max_pipelines)
+    
+    # Filter out excluded domains (same as non-production)
+    filtered_domains = [d for d in domains if d['name'] not in exclude_domains]
+    logger.info(f"Filtered out {len(domains) - len(filtered_domains)} excluded domains from production analysis")
+    
+    repo_tasks = analytics.collect_repository_tasks(filtered_domains, days_back, max_pipelines)
     
     # Process all repositories in parallel batches
     analytics.analyze_repositories_parallel(repo_tasks)
@@ -1631,14 +2041,26 @@ def main(
     max_pipelines_per_repo: int = 10,
     env: str = "prod",
     prod_group_id: Union[str, int] = "410115",
-    max_workers: int = 8,
-    batch_size: int = 40,
+    max_workers: int = 16,
+    batch_size: int = 80,
     upload_to_confluence: bool = False,                 # ← Controls Confluence upload
     upload_only: bool = False                           # ← Upload existing reports only
 ) -> GitLabCICDAnalytics:
+    
+    # Print configuration at start
+    print(f"Starting GitLab CI/CD Analytics with {max_workers} workers, batch size {batch_size}")
+    
+    # Timer starts
+    start_time = time.time()
+
     # Initialize default excluded domains
     if exclude_domains is None:
-        exclude_domains = ['central-team-repository', 'Request-for-Change']
+        exclude_domains = ['central-team-repository', 
+                           'Request-for-Change',
+                           'External_Purchased_Data',
+                           'Reference_Data',
+                           'Non_GO_Data'
+                           ]
     
     try:
         # Create reports directory structure
@@ -1655,6 +2077,7 @@ def main(
                 analytics_result = _analyze_production_parallel(
                     analytics=analytics,
                     prod_group_id=prod_group_id,
+                    exclude_domains=exclude_domains,
                     days_back=days_back,
                     max_pipelines=max_pipelines_per_repo
                 )
@@ -1724,13 +2147,29 @@ def main(
                 logger.error(f"Confluence upload failed: {str(e)}")
                 logger.info("Reports were still generated locally")
         
+        # Calculate and display runtime
+        end_time = time.time()
+        runtime_seconds = end_time - start_time
+        runtime_minutes = runtime_seconds / 60
+        
+        print(f"\nScript runtime: {runtime_minutes:.1f} mins")
+        logger.info(f"Script runtime: {runtime_minutes:.1f} mins ({runtime_seconds:.1f} seconds)")
+        
         return analytics
             
     except Exception as e:
+        # Still show runtime even if there's an error
+        end_time = time.time()
+        runtime_minutes = (end_time - start_time) / 60
+        print(f"\nScript runtime before error: {runtime_minutes:.1f} mins")
         logger.error(f"Error in main execution: {e}")
         raise
 
 if __name__ == "__main__":
+
+    # Also time the overall script execution including argument parsing
+    script_start = time.time()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="prod", 
                       help="Environment to run (default: prod)", 
@@ -1739,10 +2178,10 @@ if __name__ == "__main__":
                       help="Number of days to analyze (default: 30)")
     parser.add_argument("--max_pipelines_per_repo", type=int, default=10,
                       help="Max pipelines per repo (default: 10)")
-    parser.add_argument("--max_workers", type=int, default=8, 
-                      help="Number of parallel workers (default: 8)")
-    parser.add_argument("--batch_size", type=int, default=40, 
-                      help="Batch size for processing (default: 40)")
+    parser.add_argument("--max_workers", type=int, default=16, 
+                      help="Number of parallel workers (default: 16)")
+    parser.add_argument("--batch_size", type=int, default=80, 
+                      help="Batch size for processing (default: 80)")
     parser.add_argument("--upload_only", action="store_true",
                       help="Upload existing reports without regeneration")
     parser.add_argument("--upload_confluence", action="store_true",
@@ -1776,3 +2215,8 @@ if __name__ == "__main__":
         script_path = os.path.join(os.path.dirname(__file__), "confluence.py")
         logger.info(f"Publishing to Confluence by running: {script_path}")
         subprocess.run([sys.executable, script_path, "--env", args.env], check=True)
+
+    # Final overall runtime
+    script_end = time.time()
+    total_runtime = (script_end - script_start) / 60
+    print(f"Total script runtime: {total_runtime:.1f} mins")
