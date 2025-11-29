@@ -72,7 +72,7 @@ EXCLUDED_JOBS = [
 logger = set_logg_handlers_to_console_and_file("logs/cicd_analytics.log")
 
 # GitLab API details
-gitlab_url = 'https://gitlab.dell.com/'
+gitlab_url = 'https://gitlab.com/'
 pem_file = "utils/cert.pem"
 
 # Visualization settings
